@@ -12,6 +12,7 @@ import { createAccounts } from './accounts.js';
 import { escapeText } from './html.js';
 import { clearCookie, parseCookies, roleRank, sameOrigin, serializeCookie } from './auth.js';
 import { buildAttachments, createFileStore, MAX_FILES_PER_REQUEST, parseMultipart } from './files.js';
+import { createStorage } from './storage/index.js';
 import { humanizeUntil, nextOccurrence, normalizeSchedule } from './schedule.js';
 import { ProviderError } from './providers/util.js';
 
@@ -28,7 +29,8 @@ const store = createStore(db);
 const accounts = createAccounts({ store, config });
 const parseCookiesHeader = (header) => parseCookies(header);
 const gateway = createGateway(config);
-const files = createFileStore({ db, store, uploadDir: config.uploadsDir });
+const storage = createStorage({ storage: config.storage });
+const files = createFileStore({ storage });
 const automations = createAutomationRunner({ store, gateway });
 const scheduler = createScheduler({ store, accounts, runner: automations, config });
 
@@ -395,6 +397,42 @@ const routes = {
     json(ctx.res, 200, { activity: ctx.data.listActivity(Number(ctx.url.searchParams.get('limit')) || 8) });
   },
 
+  /**
+   * Storage diagnostics. Members can see where their files live; only a manager
+   * can make the server talk to the bucket, because that is an operator action
+   * with a credential behind it.
+   */
+  'GET /api/storage': async (ctx) => {
+    guard(ctx, 'read');
+    const described = files.describe();
+    const active = described.drivers.find((driver) => driver.driver === described.driver) || described.drivers[0] || {};
+    json(ctx.res, 200, {
+      ...described,
+      // The active driver's own details (bucket, endpoint, directory) are useful
+      // on their own, so they are surfaced rather than buried in the list.
+      active,
+      ...active,
+      usage: ctx.data.fileStats(),
+    });
+  },
+
+  'POST /api/storage/check': async (ctx) => {
+    guard(ctx, 'manage');
+    const started = Date.now();
+    try {
+      const result = await files.check();
+      json(ctx.res, 200, { ok: true, ms: Date.now() - started, ...result });
+    } catch (error) {
+      // A failed probe is a finding, not a server fault: report it as such.
+      json(ctx.res, 200, {
+        ok: false,
+        ms: Date.now() - started,
+        driver: storage.kind,
+        error: { message: error.message, code: error.code || 'storage_error', hint: error.hint || '' },
+      });
+    }
+  },
+
   'GET /api/settings': async (ctx) => {
     guard(ctx, 'read');
     json(ctx.res, 200, { settings: ctx.data.getSettings(), providers: providerSummary(), role: ctx.role, workspace: ctx.workspace, user: ctx.user });
@@ -497,24 +535,46 @@ async function handleUpload(ctx) {
   const projectId = url.searchParams.get('projectId') || parts.find((part) => part.name === 'projectId')?.data?.toString('utf8') || null;
   const project = projectId ? data.getProject(projectId) : null;
   const scoped = files.forWorkspace(data);
-  const stored = parts.map((part) => scoped.write({
-    name: part.filename || part.name,
-    mime: part.type,
-    buffer: part.data,
-    kind: 'attachment',
-    projectId: project?.id || null,
-  }));
+  // Sequential on purpose: an object store round trip per file is fast enough
+  // for the eight files this endpoint accepts, and a failure then names the
+  // file it happened on instead of racing its siblings.
+  const stored = [];
+  for (const part of parts) {
+    stored.push(await scoped.write({
+      name: part.filename || part.name,
+      mime: part.type,
+      buffer: part.data,
+      kind: 'attachment',
+      projectId: project?.id || null,
+    }));
+  }
 
   if (project) data.touchProject(project.id);
   json(res, 201, { files: stored, project: project ? data.getProject(project.id) : null, storage: data.fileStats() });
 }
 
-/** Streams a stored upload with the headers a browser needs to show it inline. */
+/**
+ * Streams a stored file with the headers a browser needs to show it inline.
+ *
+ * The bytes normally travel through this route, which is what keeps the tenancy
+ * check in Phase 4 true for files too: only a member of the owning workspace can
+ * ask for the id. With `AI_STUDIO_STORAGE_REDIRECT=1` and an object store that
+ * can sign URLs, the response is a short-lived redirect straight to the bucket
+ * instead — faster for large files, at the cost of the link working for anyone
+ * who holds it until it expires.
+ */
 async function serveStoredFile(ctx, id, download = false) {
   const { res, req, data } = ctx;
   // Scoped lookup: a file id from another workspace simply does not resolve.
   const row = data.getFileRow(id);
   if (!row) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
+
+  const direct = files.forWorkspace(data).presignedFor(row);
+  if (direct && req.method !== 'HEAD') {
+    res.writeHead(302, { Location: direct, 'Cache-Control': 'private, no-store' });
+    return res.end();
+  }
+
   const body = await files.read(row);
   res.writeHead(200, {
     'Content-Type': row.mime,
@@ -553,7 +613,8 @@ function capabilities() {
     realProviders: providerSummary().some((provider) => provider.configured && provider.id !== 'mock'),
     fileUploads: true,
     attachments: true,
-    fileStorage: 'local-disk',
+    fileStorage: storage.kind === 's3' ? 'object-storage' : 'local-disk',
+    storageDriver: storage.kind,
     billing: false,
     scheduling: Boolean(config.scheduler.enabled),
     eventTriggers: true,
@@ -668,12 +729,12 @@ async function handleGenerate(ctx) {
       }
     }
 
-    // Generated images are written to disk and referenced by URL, so rows stay
+    // Generated images are stored as objects and referenced by URL, so rows stay
     // small and the browser can cache them like any other file.
     let assetUrl = summary?.assetUrl || '';
     let assetFile = null;
     if (assetUrl.startsWith('data:')) {
-      assetFile = scopedFiles.writeDataUrl({
+      assetFile = await scopedFiles.writeDataUrl({
         dataUrl: assetUrl,
         name: `${project?.title || 'generation'}`.replace(/[^\w.-]+/g, '-').slice(0, 60) || 'output',
         projectId: project?.id || null,
@@ -808,6 +869,9 @@ async function handleItemRoute(ctx) {
       });
     }
     const wasActive = id === ctx.workspace.id;
+    // Objects first: the rows that name them are about to be cascaded away.
+    const purged = await files.purgeWorkspace(store.forWorkspace(id)).catch((error) => ({ removed: 0, bytes: 0, failed: [error.message] }));
+    if (purged.failed?.length) console.warn(`Workspace ${id}: ${purged.failed.length} object(s) could not be removed.`);
     store.deleteWorkspace(id);
     const remaining = store.listWorkspacesForUser(user.id);
     if (!remaining.length) {
@@ -818,6 +882,7 @@ async function handleItemRoute(ctx) {
     if (wasActive) accounts.switchWorkspace(ctx.auth, remaining[0].id);
     return json(res, 200, {
       deleted: true,
+      storage: { removed: purged.removed, bytes: purged.bytes },
       workspace: wasActive ? { ...store.getWorkspace(remaining[0].id), role: remaining[0].role } : ctx.workspace,
       workspaces: remaining.map(({ id: workspaceId, name, role }) => ({ id: workspaceId, name, role })),
     });
@@ -938,7 +1003,7 @@ async function handleItemRoute(ctx) {
     if (req.method === 'GET' || req.method === 'HEAD') return serveStoredFile(ctx, id, url.searchParams?.get('download') === '1');
     if (req.method === 'DELETE') {
       guard(ctx, 'write');
-      const removed = files.forWorkspace(data).remove(id);
+      const removed = await files.forWorkspace(data).remove(id);
       if (!removed) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
       return json(res, 200, { deleted: true, storage: data.fileStats() });
     }
@@ -1128,6 +1193,17 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/** One line that says where files are going, without ever printing a secret. */
+function storageLine() {
+  const described = files.describe();
+  const active = described.drivers.find((driver) => driver.driver === described.driver) || described.drivers[0];
+  if (described.driver === 's3') {
+    return `s3 · bucket ${active.bucket} at ${active.endpoint} · prefix ${active.prefix || '(root)'}${described.redirects ? ' · presigned redirects on' : ''}`;
+  }
+  const extra = described.drivers.length > 1 ? ' · s3 credentials also loaded (older objects still readable)' : '';
+  return `local disk · ${active.directory}${extra}`;
+}
+
 function logRequest(req, pathname, status, started) {
   if (process.env.AI_STUDIO_QUIET === '1') return;
   const ms = Date.now() - started;
@@ -1160,7 +1236,7 @@ server.listen(config.port, config.host, () => {
   console.log('  AI Studio OS');
   console.log(`  → http://localhost:${config.port}`);
   console.log(`  → database: ${config.dbPath}`);
-  console.log(`  → uploads:  ${config.uploadsDir}`);
+  console.log(`  → storage:  ${storageLine()}`);
   console.log(`  → ${mode}`);
   if (gateway.isDemoOnly()) console.log('  → add a provider key to .env for real generation (see .env.example)');
   if (accounts.isFirstRun()) {

@@ -288,6 +288,15 @@ const connections = $('#app-content').innerHTML || '';
 check('Connections tab lists all providers', ['OpenAI', 'Anthropic', 'Google Gemini', 'Ollama', 'Studio demo engine'].every((name) => connections.includes(name)));
 check('Connections tab names the env var', connections.includes('OPENAI_API_KEY'));
 
+console.log('\nFile storage panel');
+check('Storage panel names the driver', connections.includes('Local disk'), 'driver label rendered');
+check('Storage panel shows where bytes live', /on this machine/.test($('#app-content').innerHTML || ''), 'directory rendered');
+check('Storage panel counts the objects', /object/.test($('#app-content').innerHTML || ''), 'usage line rendered');
+await app.click('[data-action="storage-check"]');
+const probed = await app.waitFor(() => ($('#app-content').innerHTML || '').includes('Storage answered in'), { label: 'the storage probe to report' });
+check('Testing storage reports a real result', probed, ($('.storage-result')?.textContent || '').slice(0, 90));
+check('The probe is shown as a success, not an error', Boolean($('.storage-result.is-ok')) && !$('.storage-result.is-bad'), ($('.storage-result')?.className || ''));
+
 console.log('\nAccount settings');
 await app.click('[data-action="settings-tab"][data-tab="Profile"]');
 await wait(60);

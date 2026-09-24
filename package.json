@@ -2,7 +2,7 @@
   "name": "ai-studio-os",
   "version": "0.2.0",
   "private": true,
-  "description": "AI Studio OS — a creative AI workspace with a provider-agnostic generation gateway and SQLite persistence.",
+  "description": "AI Studio OS \u2014 a creative AI workspace with a provider-agnostic generation gateway and SQLite persistence.",
   "type": "module",
   "engines": {
     "node": ">=22.5.0"
@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node --no-warnings=ExperimentalWarning server/index.js",
     "dev": "node --watch --no-warnings=ExperimentalWarning server/index.js",
-    "test": "node --no-warnings=ExperimentalWarning server/selftest.js"
+    "test": "node --no-warnings=ExperimentalWarning server/selftest.js",
+    "storage:check": "node --no-warnings=ExperimentalWarning tools/storage-check.mjs",
+    "test:frontend": "node tools/frontend-smoke.mjs"
   },
   "dependencies": {}
 }

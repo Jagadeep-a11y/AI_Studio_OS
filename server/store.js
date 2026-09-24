@@ -289,8 +289,8 @@ function createWorkspaceStore(db, workspaceId, root) {
       ORDER BY created_at DESC LIMIT ?`),
     runOne: db.prepare('SELECT * FROM automation_runs WHERE id = ?'),
 
-    fileInsert: db.prepare(`INSERT INTO files (id, workspace_id, name, mime, size, path, kind, excerpt, project_id, generation_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    fileInsert: db.prepare(`INSERT INTO files (id, workspace_id, name, mime, size, path, kind, excerpt, project_id, generation_id, storage_driver, storage_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     fileOne: db.prepare('SELECT * FROM files WHERE id = ? AND workspace_id = ?'),
     filesForProject: db.prepare('SELECT * FROM files WHERE workspace_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT ?'),
     filesForGeneration: db.prepare('SELECT * FROM files WHERE workspace_id = ? AND generation_id = ? ORDER BY created_at ASC'),
@@ -540,9 +540,17 @@ function createWorkspaceStore(db, workspaceId, root) {
       }));
     },
 
+    /** The workspace this store is scoped to. Object keys are namespaced by it. */
+    workspaceId,
+
     // --- Files --------------------------------------------------------------
-    createFile({ id, name, mime, size, path: storedPath, kind = 'attachment', excerpt = '', projectId = null, generationId = null }) {
-      statements.fileInsert.run(id, workspaceId, name, mime, size, storedPath, kind, excerpt, projectId, generationId, nowIso());
+    /**
+     * `path` is kept in the row for databases from before object storage; new
+     * files record the driver and key the storage layer actually used.
+     */
+    createFile({ id, name, mime, size, path: storedPath, kind = 'attachment', excerpt = '', projectId = null, generationId = null, storageDriver = 'local', storageKey = null }) {
+      const key = storageKey || storedPath;
+      statements.fileInsert.run(id, workspaceId, name, mime, size, key, kind, excerpt, projectId, generationId, storageDriver, key, nowIso());
       return this.getFile(id);
     },
     getFile(id) {

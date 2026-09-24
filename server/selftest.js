@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { createFakeS3 } from './fixtures/fake-s3.js';
 
 /**
  * End-to-end self test.
@@ -85,7 +86,7 @@ function createClient(target = base, label = 'client') {
     }
   }
 
-  async function request(path_, { method = 'GET', body, rawBody, headers = {}, form, originHeader, token, raw = false } = {}) {
+  async function request(path_, { method = 'GET', body, rawBody, headers = {}, form, originHeader, token, raw = false, redirect } = {}) {
     const requestHeaders = { ...headers };
     if (body !== undefined) requestHeaders['Content-Type'] = 'application/json';
     if (originHeader) requestHeaders.Origin = originHeader;
@@ -97,6 +98,7 @@ function createClient(target = base, label = 'client') {
       method,
       headers: requestHeaders,
       body: form || rawBody || (body !== undefined ? JSON.stringify(body) : undefined),
+      ...(redirect ? { redirect } : {}),
     });
     absorb(response);
     if (raw) return response;
@@ -143,7 +145,7 @@ async function readStream(response) {
   return events;
 }
 
-function startServer({ dbFile, uploadPath, serverPort }) {
+function startServer({ dbFile, uploadPath, serverPort, extraEnv = {} }) {
   const child = spawn(process.execPath, ['--no-warnings=ExperimentalWarning', path.join(root, 'server', 'index.js')], {
     cwd: root,
     env: {
@@ -158,6 +160,7 @@ function startServer({ dbFile, uploadPath, serverPort }) {
       AI_STUDIO_SCHEDULER_TICK_MS: '300',
       AI_STUDIO_SCHEDULER_BACKOFF_MS: '1000',
       AI_STUDIO_LOGIN_MAX_ATTEMPTS: '4',
+      ...extraEnv,
       // Never let a developer's real keys be used (or spent) by the test run.
       OPENAI_API_KEY: '',
       ANTHROPIC_API_KEY: '',
@@ -555,6 +558,166 @@ try {
   check('Deleting a workspace needs its name as confirmation', wrongConfirm.status === 400 && wrongConfirm.body?.error?.code === 'confirmation_required');
   const deleted = await owner.del(`/api/workspaces/${second.body.workspace.id}`, { confirm: 'Side Projects' });
   check('An owner can delete their own workspace', deleted.status === 200 && deleted.body.deleted === true);
+
+  // --- Object storage ------------------------------------------------------
+  /**
+   * The fake S3 below verifies every SigV4 signature by rebuilding the canonical
+   * request from what arrived on the wire, so a signing bug cannot pass. This
+   * section drives a *second* server instance configured to write to it.
+   */
+  console.log('\nObject storage (S3 driver)');
+  const bucket = 'studio-test-bucket';
+  const fakeS3 = createFakeS3({ accessKeyId: 'test-key', secretAccessKey: 'test-secret' });
+  const { endpoint: s3Endpoint } = await fakeS3.listen();
+  const storageDb = path.join(tmpDir, 'storage.db');
+  const storagePort = port + 2;
+  const storageChild = startServer({
+    dbFile: storageDb,
+    uploadPath: path.join(tmpDir, 'storage-uploads'),
+    serverPort: storagePort,
+    extraEnv: {
+      AI_STUDIO_STORAGE: 's3',
+      AI_STUDIO_S3_BUCKET: bucket,
+      AI_STUDIO_S3_ENDPOINT: s3Endpoint,
+      AI_STUDIO_S3_REGION: 'auto',
+      AI_STUDIO_S3_ACCESS_KEY: 'test-key',
+      AI_STUDIO_S3_SECRET_KEY: 'test-secret',
+      AI_STUDIO_S3_PREFIX: 'studio',
+    },
+  });
+  const storageBase = `http://127.0.0.1:${storagePort}`;
+  const storageUp = await waitForServer(storageBase);
+  check('A server configured for S3 boots', storageUp, storageChild.log.slice(-600));
+
+  if (storageUp) {
+    const s3Owner = createClient(storageBase, 's3-owner');
+    const s3Signup = await s3Owner.post('/api/auth/signup', { email: 's3@example.com', name: 'S3 Owner', password: 's3-owner-pass' });
+    check('Signing up works the same on the S3 driver', s3Signup.status === 201);
+
+    const described = await s3Owner.get('/api/storage');
+    check('Storage describes itself as S3', described.body.driver === 's3' && described.body.bucket === bucket, JSON.stringify(described.body).slice(0, 120));
+    check('Storage diagnostics carry no credentials', !JSON.stringify(described.body).includes('test-secret') && !JSON.stringify(described.body).includes('test-key'));
+
+    const probe = await s3Owner.post('/api/storage/check');
+    check('The bucket probe writes, reads, and deletes', probe.body.ok === true && probe.body.driver === 's3', JSON.stringify(probe.body).slice(0, 160));
+    check('The probe leaves nothing behind', fakeS3.keysFor(bucket).filter((key) => key.includes('_healthcheck')).length === 0);
+    const invited = await s3Owner.post('/api/invites', { email: 'viewer@example.com', role: 'viewer' });
+    const memberProbe = createClient(storageBase, 's3-viewer');
+    await memberProbe.post(`/api/invites/${String(invited.body.acceptUrl).split('invite=')[1]}/accept`, { name: 'S3 Viewer', password: 's3-viewer-pass' });
+    check('A viewer can read the storage description', (await memberProbe.get('/api/storage')).status === 200);
+    check('Only a manager can probe the bucket', (await memberProbe.post('/api/storage/check')).status === 403);
+
+    const form = new FormData();
+    form.append('files', new Blob(['Object storage brief. Target: a ceramics studio.\n'], { type: 'text/plain' }), 's3-brief.txt');
+    const uploaded = await s3Owner.request('/api/files', { method: 'POST', form });
+    const uploadedFile = uploaded.body.files?.[0];
+    check('An upload lands in the bucket', uploaded.status === 201 && fakeS3.keysFor(bucket).some((key) => key.endsWith('.txt')), JSON.stringify(fakeS3.keysFor(bucket)));
+    check('Objects are keyed per workspace', fakeS3.keysFor(bucket).some((key) => key.startsWith(`studio/w/`) && key.includes(uploadedFile?.id || 'nope')), JSON.stringify(fakeS3.keysFor(bucket)));
+
+    const fetched = await s3Owner.request(`/api/files/${uploadedFile.id}`, { raw: true });
+    const fetchedText = await fetched.text();
+    check('The API streams the bytes back from the bucket', fetched.status === 200 && fetchedText.includes('Object storage brief'), `${fetched.status} · ${fetchedText.slice(0, 40)}`);
+    check('The served file keeps its content type', (fetched.headers.get('content-type') || '').includes('text/plain'));
+
+    // A generation that produces an image must store the asset in the bucket too.
+    const imageEvents = await s3Owner.stream('/api/generate', { prompt: 'A still life with a ceramic cup.', mode: 'Image', title: 'S3 asset' });
+    const imageDone = imageEvents.find((item) => item.event === 'done')?.data;
+    check('A generated asset is stored as an object', imageDone?.generation?.assetUrl?.startsWith('/api/files/'), imageDone?.generation?.assetUrl);
+    const asset = await s3Owner.request(imageDone.generation.assetUrl, { raw: true });
+    check('The stored asset downloads from the bucket', asset.status === 200 && Number(asset.headers.get('content-length')) > 100, `${asset.status} · ${asset.headers.get('content-length')} bytes`);
+
+    const attachments = await s3Owner.stream('/api/generate', {
+      prompt: 'Use the attached brief.',
+      mode: 'Writing',
+      title: 'S3 reference',
+      fileIds: [uploadedFile.id],
+    });
+    const attachmentEvents = attachments.find((item) => item.event === 'meta');
+    check('An attachment is read back out of the bucket for a generation', attachmentEvents?.data.references?.length === 1, JSON.stringify(attachmentEvents?.data.references));
+
+    const removed = await s3Owner.del(`/api/files/${uploadedFile.id}`);
+    check('Deleting a file removes the object', removed.status === 200 && !fakeS3.keysFor(bucket).some((key) => key.includes(uploadedFile.id)), JSON.stringify(fakeS3.keysFor(bucket)));
+
+    // Presigned redirects are opt-in and produce a URL the bucket accepts.
+    const redirectChild = startServer({
+      dbFile: storageDb,
+      uploadPath: path.join(tmpDir, 'storage-uploads'),
+      serverPort: storagePort + 1,
+      extraEnv: {
+        AI_STUDIO_STORAGE: 's3',
+        AI_STUDIO_S3_BUCKET: bucket,
+        AI_STUDIO_S3_ENDPOINT: s3Endpoint,
+        AI_STUDIO_S3_REGION: 'auto',
+        AI_STUDIO_S3_ACCESS_KEY: 'test-key',
+        AI_STUDIO_S3_SECRET_KEY: 'test-secret',
+        AI_STUDIO_S3_PREFIX: 'studio',
+        AI_STUDIO_STORAGE_REDIRECT: '1',
+      },
+    });
+    const redirectBase = `http://127.0.0.1:${storagePort + 1}`;
+    const redirectUp = await waitForServer(redirectBase);
+    check('A server with presigned redirects boots', redirectUp, redirectChild.log.slice(-400));
+    if (redirectUp) {
+      const redirectClient = createClient(redirectBase, 's3-redirect');
+      await redirectClient.post('/api/auth/login', { email: 's3@example.com', password: 's3-owner-pass' });
+      const redirectForm = new FormData();
+      redirectForm.append('files', new Blob(['Redirect me to the bucket.\n'], { type: 'text/plain' }), 'redirect.txt');
+      const redirectUpload = await redirectClient.request('/api/files', { method: 'POST', form: redirectForm });
+      const target = redirectUpload.body.files?.[0];
+      const firstHop = await redirectClient.request(`/api/files/${target.id}`, { raw: true, redirect: 'manual' });
+      // (client defaults to following redirects; this one asks for the first hop)
+      const location = firstHop.headers.get('location') || '';
+      check('A file read redirects to a presigned URL', firstHop.status === 302 && location.includes('X-Amz-Signature'), `${firstHop.status} ${location.slice(0, 90)}`);
+      const direct = await fetch(location);
+      check('The presigned URL serves the bytes and the bucket accepted the signature', direct.status === 200 && (await direct.text()).includes('Redirect me'), `status ${direct.status}`);
+      // A tenant boundary must still hold: another workspace's file id is a 404.
+      const stranger = await redirectClient.request('/api/files/f-does-not-exist', { raw: true, redirect: 'manual' });
+      check('An unknown file id is still a 404 behind redirects', stranger.status === 404);
+    }
+    redirectChild.kill('SIGTERM');
+
+    // Switching back to local must not orphan objects written while S3 was active.
+    const mixedChild = startServer({
+      dbFile: storageDb,
+      uploadPath: path.join(tmpDir, 'storage-uploads'),
+      serverPort: storagePort + 2,
+      extraEnv: {
+        AI_STUDIO_STORAGE: 'local',
+        AI_STUDIO_S3_BUCKET: bucket,
+        AI_STUDIO_S3_ENDPOINT: s3Endpoint,
+        AI_STUDIO_S3_REGION: 'auto',
+        AI_STUDIO_S3_ACCESS_KEY: 'test-key',
+        AI_STUDIO_S3_SECRET_KEY: 'test-secret',
+      },
+    });
+    const mixedBase = `http://127.0.0.1:${storagePort + 2}`;
+    const mixedUp = await waitForServer(mixedBase);
+    check('Switching back to local storage still boots', mixedUp, mixedChild.log.slice(-400));
+    if (mixedUp) {
+      const mixed = createClient(mixedBase, 'mixed');
+      await mixed.post('/api/auth/login', { email: 's3@example.com', password: 's3-owner-pass' });
+      const before = fakeS3.keysFor(bucket).length;
+      const oldAsset = await mixed.request(imageDone.generation.assetUrl, { raw: true });
+      check('Files written to S3 are still served after switching to local', oldAsset.status === 200, `status ${oldAsset.status}`);
+      const localForm = new FormData();
+      localForm.append('files', new Blob(['Back on disk.\n'], { type: 'text/plain' }), 'local.txt');
+      const localUpload = await mixed.request('/api/files', { method: 'POST', form: localForm });
+      const localFile = localUpload.body.files?.[0];
+      check('New uploads go to disk again', fakeS3.keysFor(bucket).length === before, `bucket grew by ${fakeS3.keysFor(bucket).length - before}`);
+      check('Both drivers are reported as available', (await mixed.get('/api/storage')).body.drivers?.length === 2);
+      const localRead = await mixed.request(`/api/files/${localFile.id}`, { raw: true });
+      check('The local file is readable in the same session', localRead.status === 200 && (await localRead.text()).includes('Back on disk'));
+
+      // Deleting a workspace must take its objects with it.
+      const doomed = (await mixed.get('/api/bootstrap')).body.workspace;
+      const doomedFiles = fakeS3.keysFor(bucket).length;
+      const deleted = await mixed.del(`/api/workspaces/${doomed.id}`, { confirm: doomed.name });
+      check('Deleting a workspace removes its objects', deleted.status === 200 && fakeS3.keysFor(bucket).length < doomedFiles, `${doomedFiles} → ${fakeS3.keysFor(bucket).length}`);
+    }
+    mixedChild.kill('SIGTERM');
+  }
+  storageChild.kill('SIGTERM');
+  await fakeS3.close();
 
   // --- Migrating a database from before accounts existed -------------------
   console.log('\nLegacy migration');

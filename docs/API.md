@@ -62,8 +62,10 @@ another host is refused with `code: "cross_origin"`. Non-browser clients (curl, 
 | `GET /api/scheduler` | Scheduler health: enabled, tick, counts, next automation |
 | `POST /api/files` | **Upload reference files** (multipart) |
 | `GET /api/files` | Stored files (`?projectId=`, `?limit=`) |
-| `GET /api/files/:id` | Serve a stored file (`?download=1` forces an attachment) |
+| `GET /api/files/:id` | Serve a stored file (`?download=1` forces an attachment; `302` to a presigned URL when redirects are enabled) |
 | `DELETE /api/files/:id` | Delete a stored file and its bytes |
+| `GET /api/storage` | Which driver holds the bytes, its details, and usage — any member |
+| `POST /api/storage/check` | Write, read back, and delete a probe object — owners and admins |
 | `GET /api/projects/:id/files` | A project's reference files and generated assets |
 | `GET /api/usage` | Plan, totals, breakdowns, seven-day series, recent runs |
 | `GET /api/activity` | Dashboard feed (`?limit=`) |
@@ -206,6 +208,41 @@ Text files come back with an `excerpt`; images are previewed in the UI by `url`.
 `data/uploads/` (`AI_STUDIO_UPLOADS` overrides), never in a database row.
 
 ---
+
+## `GET /api/storage`
+
+Where files actually go, and how much is stored. Safe to show any member: it never includes
+credentials.
+
+```bash
+curl -s -b cookies.txt localhost:4173/api/storage
+```
+
+```json
+{ "driver": "s3", "label": "S3-compatible (studio-files)", "redirects": false,
+  "active": { "driver": "s3", "bucket": "studio-files", "endpoint": "https://…r2.cloudflarestorage.com",
+              "region": "auto", "prefix": "studio", "addressing": "path-style" },
+  "drivers": [ { "driver": "local", "directory": "/app/data/uploads" },
+               { "driver": "s3", "bucket": "studio-files", "endpoint": "…" } ],
+  "usage": { "count": 12, "bytes": 1_884_320 } }
+```
+
+`POST /api/storage/check` performs the only test that matters — it writes an object, reads it back,
+compares the bytes, and deletes it:
+
+```json
+{ "ok": true, "ms": 143, "bytes": 46, "driver": "s3", "bucket": "studio-files" }
+```
+
+A failure is reported as a 200 with `ok: false` and the provider's own reason, because "the bucket
+refused us" is a finding rather than a server fault:
+
+```json
+{ "ok": false, "ms": 41,
+  "error": { "message": "Object storage rejected the request: SignatureDoesNotMatch — The request signature we calculated does not match the signature you provided",
+             "code": "storage_signature_does_not_match",
+             "hint": "The storage credentials in .env do not match the bucket. Re-check the key id and secret." } }
+```
 
 ## `GET /api/scheduler`
 

@@ -200,6 +200,8 @@
     settingsTab: 'Profile',
     notificationsRead: false,
     session: { user: null, role: null, canWrite: false, canManage: false, workspaces: [], members: [], invites: [], assignableRoles: [] },
+    storage: null,         // live storage driver description and usage
+    storageCheck: null,    // result of the last "test the bucket" run
     auth: { mode: 'signin', firstRun: false, claimable: [], signupsOpen: true, invite: null, inviteToken: '', error: '', busy: false },
     attachments: [],       // reference files waiting to be sent with a prompt
     uploads: [],           // files stored on the server for this workspace
@@ -741,12 +743,14 @@
   async function loadWorkspaceFiles() {
     if (!api.online) return;
     try {
-      const [filePayload, scheduler] = await Promise.all([
+      const [filePayload, scheduler, storage] = await Promise.all([
         api.request('/api/files?limit=50'),
         api.request('/api/scheduler'),
+        api.request('/api/storage').catch(() => null),
       ]);
       state.uploads = filePayload.files;
       state.scheduler = scheduler;
+      if (storage) state.storage = storage;
       if (state.page === 'settings') {
         const content = document.getElementById('app-content');
         if (content) content.innerHTML = renderSettingsPage();
@@ -972,7 +976,7 @@
     ${api.online ? `<h2 style="margin-top:18px">Automation scheduler</h2>
       <div class="scheduler-note">${icon('clock')}<span>${escapeHTML(schedulerHeadline())} · ${escapeHTML(schedulerDetail())}</span></div>
       <p>Due workflows are claimed by the server before they run, so a restart never double-fires one. A window missed while the server was off runs once on the next check — never a backlog.</p>
-      <p>Storage: ${(state.uploads || []).length} file${(state.uploads || []).length === 1 ? '' : 's'} on disk in <code>data/uploads</code>. Generated images are saved as files instead of data URLs inside the database.</p>` : ''}`;
+      </p>${storagePanelHTML()}` : ''}`;
 
     // Account security is its own form: it must not travel with profile edits.
     const passwordPanel = state.settingsTab === 'Profile' && signedIn() && api.online
@@ -994,6 +998,36 @@
   }
 
   const membersOwnerName = () => (state.session.members || []).find((member) => member.role === 'owner')?.name || 'the owner';
+
+  /**
+   * Where files actually go. Metadata is always in SQLite; the bytes are either
+   * on this machine or in an S3-compatible bucket, and the operator needs to be
+   * able to see which — and to test it without reading server logs.
+   */
+  function storagePanelHTML() {
+    const info = state.storage;
+    const usage = info?.usage || { count: (state.uploads || []).length, bytes: (state.uploads || []).reduce((total, file) => total + (file.size || 0), 0) };
+    const isS3 = info?.driver === 's3';
+    const where = !info
+      ? '<span class="storage-unknown">not reported by this server</span>'
+      : isS3
+        ? `<code>${escapeHTML(info.bucket || '')}</code> at <code>${escapeHTML(info.endpoint || '')}</code>${info.prefix ? ` · prefix <code>${escapeHTML(info.prefix)}</code>` : ''}`
+        : `<code>${escapeHTML(info.directory || 'data/uploads')}</code> on this machine`;
+    const result = state.storageCheck;
+    const verdict = !result
+      ? ''
+      : result.ok
+        ? `<div class="storage-result is-ok">${icon('check')}<span>Storage answered in ${escapeHTML(String(result.ms))}ms — ${escapeHTML(String(result.bytes))} bytes written, read back, and deleted.</span></div>`
+        : `<div class="storage-result is-bad">${icon('close')}<span>Storage check failed: ${escapeHTML(result.error?.message || 'no answer')}${result.error?.hint ? ` — ${escapeHTML(result.error.hint)}` : ''}</span></div>`;
+    return `<h2 style="margin-top:18px">File storage</h2>
+      <div class="scheduler-note">${icon(isS3 ? 'globe' : 'folder')}<span><strong>${escapeHTML(info?.label || 'Local disk')}</strong> · ${where}</span></div>
+      <p>Metadata stays in SQLite; only the bytes live in the driver above. ${isS3
+        ? 'Switching drivers later is safe: every row remembers which driver holds its file, so older objects stay readable.'
+        : 'Point <code>AI_STUDIO_STORAGE=s3</code> at a bucket when more than one server needs the same files.'}</p>
+      <p>${escapeHTML(String(usage.count))} object${usage.count === 1 ? '' : 's'} · ${escapeHTML(humanSize(usage.bytes))}${info?.redirects ? ' · reads redirect to short-lived signed URLs' : ' · reads stream through the API so every download is still membership-checked'}</p>
+      ${canManage() && api.online ? `<div class="settings-actions">${icon('key')}<button class="secondary-button" type="button" data-action="storage-check">${icon('refresh')} Test storage</button></div>` : ''}
+      ${verdict}`;
+  }
 
   function openModal(html, type = 'generic', options = {}) {
     closePopover();
@@ -2087,6 +2121,21 @@
       case 'revoke-invite': revokeInvite(button.dataset.id); break;
       case 'remove-member': removeMember(button.dataset.id, button.dataset.name); break;
       case 'delete-workspace': deleteWorkspaceModal(); break;
+      case 'storage-check': {
+        button.disabled = true;
+        state.storageCheck = null;
+        const redraw = () => {
+          if (state.page === 'settings') {
+            const content = document.getElementById('app-content');
+            if (content) content.innerHTML = renderSettingsPage();
+          }
+        };
+        api.request('/api/storage/check', { method: 'POST' })
+          .then((result) => { state.storageCheck = result; })
+          .catch((error) => { state.storageCheck = { ok: false, ms: 0, error: { message: error.message, hint: error.hint } }; })
+          .finally(() => { redraw(); button.disabled = false; });
+        break;
+      }
       case 'transfer-ownership': transferOwnershipModal(); break;
       case 'confirm-remove-member': {
         const id = button.dataset.id;

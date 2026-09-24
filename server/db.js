@@ -126,9 +126,13 @@ CREATE TABLE IF NOT EXISTS files (
   path          TEXT NOT NULL,
   kind          TEXT NOT NULL DEFAULT 'attachment',
   excerpt       TEXT NOT NULL DEFAULT '',
-  project_id    TEXT REFERENCES projects(id) ON DELETE SET NULL,
-  generation_id TEXT REFERENCES generations(id) ON DELETE SET NULL,
-  created_at    TEXT NOT NULL
+  project_id     TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  generation_id  TEXT REFERENCES generations(id) ON DELETE SET NULL,
+  -- Which driver holds the bytes, and the key it knows them by. Rows written
+  -- before object storage existed are 'local' with the filename they already have.
+  storage_driver TEXT NOT NULL DEFAULT 'local',
+  storage_key    TEXT,
+  created_at     TEXT NOT NULL
 );
 
 
@@ -246,6 +250,12 @@ function migrate(db) {
   const addColumn = (table, name, definition) => {
     if (!columnsOf(table).includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition};`);
   };
+  // Object storage: existing rows keep their bytes on disk, so they are marked
+  // as local and keyed by the filename they were already stored under.
+  addColumn('files', 'storage_driver', "TEXT NOT NULL DEFAULT 'local'");
+  addColumn('files', 'storage_key', 'TEXT');
+  db.prepare("UPDATE files SET storage_key = path WHERE storage_key IS NULL").run();
+
   addColumn('automations', 'schedule', 'TEXT');
   addColumn('automations', 'trigger_label', "TEXT NOT NULL DEFAULT 'Manual only'");
   addColumn('automations', 'next_run_at', 'TEXT');
@@ -439,9 +449,11 @@ export function fileFromRow(row) {
     mime: row.mime,
     size: row.size,
     kind: row.kind,
-    // The stored filename (not a path): the file store resolves it against the
-    // uploads directory, and clients read files through `url` instead.
-    storedPath: row.path,
+    // Where the bytes live: which driver, and the key that driver knows. `path`
+    // is the pre-object-storage column and is kept only so a database from an
+    // earlier version still opens.
+    storageDriver: row.storage_driver || 'local',
+    storageKey: row.storage_key || row.path,
     excerpt: row.excerpt || '',
     projectId: row.project_id,
     generationId: row.generation_id,

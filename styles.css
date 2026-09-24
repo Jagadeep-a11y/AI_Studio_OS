@@ -794,3 +794,10 @@ body.is-locked { background: radial-gradient(120% 90% at 15% -10%, #241f45 0%, #
   .auth-card h1 { font-size: 21px; }
   .danger-zone { flex-direction: column; align-items: stretch; }
 }
+
+/* Storage diagnostics in Settings → Connections */
+.storage-result { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 9px; font-size: 10px; line-height: 1.6; }
+.storage-result .icon { flex: none; width: 14px; height: 14px; margin-top: 1px; }
+.storage-result.is-ok { border-color: #cfe9db; background: #f3fbf6; color: #2f7d5b; }
+.storage-result.is-bad { border-color: #f0d6d6; background: #fdf5f5; color: #a8454b; }
+.storage-unknown { color: var(--muted); }

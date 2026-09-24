@@ -194,6 +194,39 @@ automations watching that value and runs them in the background, so the HTTP res
 open by a model call. The run history records its source (`manual`, `scheduled`, `event`), which is
 why the same executor exists in one place.
 
+## Storage drivers
+
+File *metadata* is always in SQLite; the *bytes* go wherever the configured driver puts them. The
+seam is deliberately narrow — `put`, `get`, `exists`, `remove`, and an optional `url` — so a new
+backend is one file, and nothing above it knows whether it is writing to a directory or a bucket.
+
+```
+files.js ──► storage/index.js ──┬── storage/local.js   data/uploads/
+   (metadata, attachments)      └── storage/s3.js      any S3-compatible bucket
+                                        └── storage/sigv4.js
+```
+
+- **Rows remember their driver.** `files.storage_driver` and `files.storage_key` record which driver
+  wrote a file and the key it knows. Reads go to *that* driver, not the active one, so switching
+  from local to S3 (or back) leaves every earlier file readable — the old driver only has to stay
+  configured. Rows written before object storage existed are migrated to `local` with their existing
+  filename as the key.
+- **Keys are namespaced per workspace.** S3 keys look like `<prefix>/w/<workspaceId>/<fileId><ext>`,
+  which makes a shared bucket browsable and means a leaked object key cannot be guessed from a file
+  id alone.
+- **SigV4 is written out, not imported.** `server/storage/sigv4.js` is ~120 lines of pure functions,
+  and the test fixture (`server/fixtures/fake-s3.js`) uses the same canonical-request builder to
+  *verify* what the client signed. A client-side signing bug therefore cannot pass the suite, and one
+  written the way real S3 reads it ("scope must end in `aws4_request`", "the host header is signed in
+  a presigned URL") was caught exactly that way.
+- **Redirects are opt-in.** By default a download streams through `GET /api/files/:id`, which keeps
+  Phase 4's promise that a file id from another workspace resolves to nothing. With
+  `AI_STUDIO_STORAGE_REDIRECT=1` the server answers `302` to a short-lived presigned URL instead:
+  fewer bytes through the app, but the link is a bearer token for the object until it expires.
+- **Deleting a workspace purges its objects first**, because the rows naming them are removed by the
+  same statement that deletes the workspace. Rows are deleted before objects on a single-file
+  delete, for the same reason: an orphaned object is cheaper than a row pointing at nothing.
+
 ## Files and attachments
 
 Uploads arrive as multipart, are validated against an allowlist and a size cap, and are written to
@@ -247,9 +280,9 @@ carries a demo notice when the demo engine wrote it.
 - `SIGINT`/`SIGTERM` close the server, then the database. `AI_STUDIO_QUIET=1` silences the access log.
 - Static serving refuses to hand out `.env`, anything under `server/`, or anything under `data/`,
   and blocks path traversal outside the repository root.
-- Uploads and generated assets live in `data/uploads/` (`AI_STUDIO_UPLOADS` overrides); with an
-  in-memory database the file store falls back to a temporary directory so a test run leaves no
-  traces behind.
+- Uploads and generated assets live in `data/uploads/` by default (`AI_STUDIO_UPLOADS` overrides,
+  `AI_STUDIO_STORAGE=s3` moves them to a bucket); with an in-memory database the local driver falls
+  back to a temporary directory so a test run leaves no traces behind.
 - The scheduler starts with the server and shuts down with it: the timer is `unref`'d, so it never
   keeps the process alive on its own.
 
@@ -265,13 +298,20 @@ Two layers, both running the real code rather than mocks:
   JSON, unconfigured provider, 404s), multipart uploads, attachments reaching the prompt, generated
   assets landing on disk, an event trigger firing from a status change, and a scheduled workflow
   running on its own — the test boots the scheduler with a fast tick so the real timer is exercised.
+  Accounts, roles, invites, tenancy isolation and the migration from a pre-accounts database are in
+  the same file, and so is object storage: it starts an in-memory S3 whose verifier rebuilds the
+  canonical request from what actually arrived, then drives a second server instance configured to
+  write to it — uploads, downloads, generated assets, attachment reads, presigned redirects, a
+  driver switch back to local, and workspace deletion purging the bucket.
 - **`node tools/frontend-smoke.mjs`** loads `index.html` into a headless DOM (jsdom, installed with
   `--no-save` so it never becomes a runtime dependency) with `fetch` pointed at a running server,
   and drives the real UI: page navigation, catalogue filtering, the Connections tab, an image
   generation and a writing generation with their streamed output and persisted history, attaching a
   reference file and confirming the dialog reports it, reading run history on the automations page,
-  building a schedule through the modal, opening a project's stored files, saving a prompt, and
-  using the command palette. It fails on any uncaught error, unhandled rejection, or
+  building a schedule through the modal, opening a project's stored files, testing the storage
+  driver from the Connections tab, saving a prompt, and using the command palette. It signs up at
+  the gate, invites a second person, accepts that invite in a second window, and verifies the
+  read-only role from both sides. It fails on any uncaught error, unhandled rejection, or
   `console.error`.
 
 That combination is why a `const` reassigned inside the boot path — invisible to the API tests —

@@ -142,6 +142,48 @@ export const config = {
 config.uploadsDir = resolveUploadsDir(str('AI_STUDIO_UPLOADS', ''), config.dbPath);
 
 /**
+ * Object storage.
+ *
+ * `local` is the default and needs nothing. `s3` covers anything that speaks the
+ * S3 REST API — AWS, Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces —
+ * because they differ only in endpoint, region, and URL style.
+ *
+ * The S3 credentials are kept even when local storage is active: rows remember
+ * which driver holds their bytes, so a switch back to local must not make
+ * already-uploaded files unreadable.
+ */
+const storageDriver = str('AI_STUDIO_STORAGE', 'local').toLowerCase() === 's3' ? 's3' : 'local';
+const s3Bucket = str('AI_STUDIO_S3_BUCKET', '');
+const s3AccessKey = str('AI_STUDIO_S3_ACCESS_KEY', str('AWS_ACCESS_KEY_ID', ''));
+const s3SecretKey = str('AI_STUDIO_S3_SECRET_KEY', str('AWS_SECRET_ACCESS_KEY', ''));
+
+config.storage = {
+  driver: storageDriver,
+  uploadsDir: config.uploadsDir,
+  // Serve a presigned URL instead of streaming through the API. Faster and
+  // cheaper for large files, but anyone with the link has the bytes for as long
+  // as it lives — so it is off unless an operator asks for it.
+  redirect: bool('AI_STUDIO_STORAGE_REDIRECT', false),
+  presignTtlMs: Math.max(30_000, num('AI_STUDIO_STORAGE_PRESIGN_MS', 5 * 60_000)),
+  s3: s3Bucket || s3AccessKey
+    ? {
+      bucket: s3Bucket,
+      endpoint: str('AI_STUDIO_S3_ENDPOINT', ''),
+      region: str('AI_STUDIO_S3_REGION', str('AWS_REGION', 'auto')),
+      accessKeyId: s3AccessKey,
+      secretAccessKey: s3SecretKey,
+      sessionToken: str('AI_STUDIO_S3_SESSION_TOKEN', str('AWS_SESSION_TOKEN', '')),
+      prefix: str('AI_STUDIO_S3_PREFIX', 'studio'),
+      // MinIO and most self-hosted gateways want path-style; AWS and R2 accept
+      // both, so path-style is the safer default and `0` switches to vhost.
+      pathStyle: bool('AI_STUDIO_S3_PATH_STYLE', true),
+      timeoutMs: num('AI_STUDIO_S3_TIMEOUT_MS', 30_000),
+      presignTtlMs: Math.max(30_000, num('AI_STUDIO_STORAGE_PRESIGN_MS', 5 * 60_000)),
+    }
+    : null,
+};
+
+/**
  * Accounts and sessions. The defaults are sized for a small studio: a month-long
  * sliding session, week-long invites, and sign-in throttling that stops a
  * password-guessing loop without locking anyone out of their own workspace.

@@ -33,7 +33,8 @@ stranger to sign up claims the seeded workspace.
 | Failures | ✅ Provider errors surface with a plain-language hint and are stored on the run |
 | Automations that run themselves | ✅ Clock schedules (interval/daily/monthly) + event triggers, with run history |
 | Reference files | ✅ Upload images and documents; images go to the model as vision input |
-| Generated assets | ✅ Written to `data/uploads/` and served by URL, not inlined in rows |
+| Generated assets | ✅ Stored as files and served by URL, not inlined in rows |
+| File storage | ✅ Local disk by default; switch to any S3-compatible bucket (AWS, R2, MinIO, B2) with one env var |
 | Accounts | ✅ Sign-up / sign-in with scrypt-hashed passwords and hashed session cookies |
 | Teams & roles | ✅ Owner / admin / editor / viewer per workspace, enforced on every route |
 | Workspaces | ✅ Per-user workspaces, switching, renaming, transfer, delete; complete data isolation |
@@ -45,7 +46,7 @@ stranger to sign up claims the seeded workspace.
 ```bash
 npm start              # production-ish: plain node, quiet experimental warnings
 npm run dev            # same, with --watch for auto restart on file changes
-npm test               # 159-check end-to-end self test (uses a temporary database)
+npm test               # 188-check end-to-end self test (uses a temporary database)
 ```
 
 Then open <http://localhost:4173>. The server binds `0.0.0.0` so it also works from a container or
@@ -167,8 +168,9 @@ Two details worth knowing:
 
 ## Reference files and assets
 
-`POST /api/files` accepts multipart uploads (`multipart/form-data`, up to 8 files, 10 MB each) and
-stores the bytes in `data/uploads/` beside the database. A generation can reference them with
+`POST /api/files` accepts multipart uploads (`multipart/form-data`, up to 8 files, 10 MB each).
+Metadata goes into SQLite and the bytes go into the configured **storage driver** — `data/uploads/`
+on this machine by default, or any S3-compatible bucket. A generation can reference them with
 `fileIds`:
 
 - **images** are sent to the provider as vision input (OpenAI `image_url`, Anthropic base64 source,
@@ -176,8 +178,44 @@ stores the bytes in `data/uploads/` beside the database. A generation can refere
 - **text documents** are appended to the prompt as reference material,
 - anything else is stored and listed, and the run records what it attached.
 
-Generated images are saved as files too, so project rows stay small and browsers can cache and
+Generated images are stored as files too, so project rows stay small and browsers can cache and
 download assets like any other URL: `GET /api/files/:id`.
+
+## Object storage
+
+The default is local disk, which is the right answer for one machine. Point
+`AI_STUDIO_STORAGE=s3` at a bucket when more than one server (or more than one container) needs the
+same files:
+
+```bash
+# Cloudflare R2
+AI_STUDIO_STORAGE=s3
+AI_STUDIO_S3_BUCKET=studio-files
+AI_STUDIO_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+AI_STUDIO_S3_REGION=auto
+AI_STUDIO_S3_ACCESS_KEY=...
+AI_STUDIO_S3_SECRET_KEY=...
+
+npm run storage:check     # writes, reads back, and deletes a probe object
+```
+
+Anything that speaks the S3 API works — AWS S3, R2, MinIO, Backblaze B2, DigitalOcean Spaces,
+Wasabi — because they differ only in endpoint, region, and URL style. Requests are signed with
+SigV4 by `server/storage/sigv4.js`, written out rather than added as a dependency, and
+`AI_STUDIO_S3_PATH_STYLE=0` switches to virtual-hosted URLs for AWS and R2.
+
+Three things worth knowing:
+
+- **Switching providers is safe.** Every file row records the driver and key it was written with, so
+  files uploaded while S3 was active are still served after switching back to local — the old
+  driver only has to stay configured.
+- **Reads stream through the API by default.** That keeps file downloads behind the same
+  membership check as everything else: only someone in the owning workspace can use a file id. With
+  `AI_STUDIO_STORAGE_REDIRECT=1` the server answers with a short-lived presigned URL instead — faster
+  and cheaper for large files, but the link then works for anyone holding it until it expires.
+- **Deleting a workspace deletes its objects** before the rows that name them are cascaded away.
+  `GET /api/storage` reports the active driver and usage; `POST /api/storage/check` (owners and
+  admins) makes the server talk to the bucket and reports what happened.
 
 ## Project layout
 
@@ -199,7 +237,14 @@ server/
   schedule.js       schedule data model, timezone math, next-occurrence engine
   scheduler.js      the tick loop: claim, run, reschedule, back off
   automations.js    one executor shared by manual, scheduled, and event runs
-  files.js          multipart parsing, disk storage, attachment preparation
+  files.js          multipart parsing, file metadata, attachment preparation
+  storage/
+    index.js        driver selection: local, s3, and reads across both
+    local.js        disk driver (data/uploads)
+    s3.js           S3-compatible driver: put/get/head/delete + presigned URLs
+    sigv4.js        AWS Signature V4, no dependency
+  fixtures/
+    fake-s3.js      in-memory S3 for tests: it *verifies* every signature
   providers/        one file per vendor: openai, anthropic, gemini, ollama, mock
   selftest.js       end-to-end API and streaming test
 docs/               architecture, API reference, provider guide
@@ -209,9 +254,10 @@ data/               SQLite database + uploaded/generated files (git-ignored)
 ## Tests
 
 ```bash
-npm test                           # 159 API, auth, tenancy, and migration checks
+npm test                           # 188 API, auth, tenancy, storage, and migration checks
 npm i --no-save jsdom              # test-only, never a runtime dependency
-node tools/frontend-smoke.mjs      # 121 UI checks (starts its own server)
+npm run test:frontend              # 126 UI checks (starts its own server)
+npm run storage:check              # is the configured bucket actually reachable?
 ```
 
 `npm test` boots the real server against a temporary database with every provider key blanked, then
@@ -227,6 +273,12 @@ rows, output counts, credits, and usage aggregates they produce. It covers:
   automation is invisible, switching cannot reach a workspace you are not in, settings are scoped;
 - **hardening**: cross-origin cookie writes refused, same-origin writes allowed, only the token
   digest in the database, workspace deletion requiring the exact name, the last workspace kept;
+- **object storage**: a second server instance is booted against an in-memory S3 that *verifies
+  every SigV4 signature* by rebuilding the canonical request from what arrived on the wire. Uploads,
+  downloads, generated assets, attachment reads, per-workspace key layout, object deletion,
+  presigned redirects, mixed local+S3 reads after a driver switch, and workspace deletion purging
+  the bucket are all exercised there — as is a reject-wrong-secret case, so the test fails if the
+  client ever signs something the bucket would refuse;
 - **the upgrade path**: a database built with the previous version's schema (kept in
   `server/fixtures/legacy-db.sql`) boots, migrates, and keeps its projects, generations, settings,
   and activity.
@@ -254,8 +306,10 @@ promotes, removes, and verifies them — failing if anything logs an error or th
   provider for its live model list and marks entries `verified`/`ID UNVERIFIED` in the UI.
 - **The demo engine is not an AI.** It writes a deterministic draft locally. Output from it is
   labelled `DEMO` in the API, the UI, and the database row.
-- **Files live on the local disk.** `data/uploads/` is fine for one machine; point it at a shared
-  volume (`AI_STUDIO_UPLOADS`) or object storage before running more than one server.
+- **Local disk is still the default.** `data/uploads/` is fine for one machine; set
+  `AI_STUDIO_STORAGE=s3` (or point `AI_STUDIO_UPLOADS` at a shared volume) before running more than
+  one server. Uploads are capped at 10 MB and sent in a single request, so there is no multipart
+  upload path for very large files, and reads stream through the server unless redirects are on.
 - **The scheduler is in-process.** It ticks inside the web server, so workflows only run while that
   process is up — a due window is caught once on the next boot. Nothing is lost or repeated, but a
   multi-instance deployment would want a shared queue.
@@ -273,8 +327,9 @@ promotes, removes, and verifies them — failing if anything logs an error or th
 
 ## Roadmap
 
-1. **Object storage** — swap the disk file store for S3/R2 and keep only URLs in SQLite.
-2. ~~**Accounts and teams**~~ — shipped in this phase: users, workspaces, memberships, invites, roles.
+1. ~~**Object storage**~~ — shipped in this phase: a storage driver layer with a local and an
+   S3-compatible driver, per-row driver memory, and a bucket probe.
+2. ~~**Accounts and teams**~~ — shipped earlier: users, workspaces, memberships, invites, roles.
 3. **Billing** — real plan management instead of the estimated credits ledger.
 4. **Canvas** — a real node/graph editor instead of the current concept page.
 5. **Non-generation automation steps** — project tidying, exports, and outbound notifications.

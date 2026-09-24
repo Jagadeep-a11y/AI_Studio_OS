@@ -1,21 +1,21 @@
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { newId } from './db.js';
 import { ProviderError } from './providers/util.js';
 
 /**
- * File storage.
+ * File metadata and where the bytes go.
  *
  * Two jobs, one place:
  *   1. Attachments the user uploads as reference material for a generation.
- *   2. Outputs a model produces (images), written out of the database and onto
- *      disk, so `asset_url` stays a short pointer instead of a megabyte of
- *      base64 in every row.
+ *   2. Outputs a model produces (images), stored out of the database so
+ *      `asset_url` stays a short pointer instead of a megabyte of base64 in
+ *      every row.
  *
- * Bytes live under `data/uploads/` and metadata lives in SQLite, which keeps the
- * database small and makes the files trivially replaceable by object storage
- * later — only this module would change.
+ * Metadata lives in SQLite; bytes live in whichever storage driver is
+ * configured (`data/uploads/` by default, or any S3-compatible bucket). Rows
+ * record the driver and key they were written with, so switching providers
+ * leaves earlier files readable. Nothing here knows how a driver works — it
+ * calls `put`, `get`, and `remove`.
  */
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MB per file
@@ -94,27 +94,32 @@ export function safeName(filename) {
 
 // --- storage ----------------------------------------------------------------
 
-export function createFileStore({ db, uploadDir }) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+export function createFileStore({ storage }) {
+  if (!storage) throw new ProviderError('The file store needs a storage driver', { status: 500, code: 'storage_misconfigured' });
 
-  const absolutePath = (row) => {
-    const stored = row?.storedPath || row?.path;
-    if (!stored) throw new ProviderError('That file has no stored location', { status: 500, code: 'file_unreadable' });
-    return path.join(uploadDir, path.basename(stored));
-  };
+  /**
+   * Rows reach this module in two shapes — the API shape from `fileFromRow`
+   * (`storageKey`, `storageDriver`) and the raw database row
+   * (`storage_key`, `storage_driver`) — so both are read here rather than at
+   * every call site.
+   */
+  const driverOf = (row) => row?.storageDriver || row?.storage_driver || 'local';
+  const keyOf = (row) => row?.storageKey || row?.storage_key || row?.path || '';
+  const driverFor = (row) => storage.for(driverOf(row));
 
   /** A file store bound to one workspace's data layer. */
   function forWorkspace(store) {
     return {
       write: (file) => write(store, file),
       writeDataUrl: (input) => writeDataUrl(store, input),
-      readLink: (row) => absolutePath(row),
-      read: (row) => readFile(row),
+      read: (row) => read(row),
       remove: (id) => remove(store, id),
+      /** A short-lived direct URL, when the driver can make one and it is enabled. */
+      presignedFor: (row) => storage.url(keyOf(row), { driver: driverOf(row) }),
     };
   }
 
-  function write(store, { name, mime, buffer, kind = 'attachment', projectId = null, generationId = null, excerpt = '' }) {
+  async function write(store, { name, mime, buffer, kind = 'attachment', projectId = null, generationId = null, excerpt = '' }) {
     if (!buffer?.length) throw new ProviderError('The file is empty', { status: 400, code: 'empty_file' });
     if (buffer.length > MAX_FILE_BYTES) {
       throw new ProviderError(`${safeName(name)} is larger than ${humanSize(MAX_FILE_BYTES)}`, { status: 413, code: 'file_too_large' });
@@ -130,32 +135,41 @@ export function createFileStore({ db, uploadDir }) {
 
     const id = newId('f');
     const extension = EXTENSIONS[safeMime] || path.extname(safeName(name)).toLowerCase() || '';
-    const stored = `${id}${extension.replace(/[^a-z0-9.]/gi, '')}`;
-    fs.writeFileSync(path.join(uploadDir, stored), buffer);
+    // The id is generated here, so the key can be derived from it — which keeps
+    // objects addressable and collision-free before the row exists.
+    const key = storage.keyFor({ workspaceId: store.workspaceId, id, extension });
+    await storage.put({ key, body: buffer, contentType: safeMime });
 
     const text = excerpt || (isTextual(safeMime) ? buffer.toString('utf8').slice(0, MAX_TEXT_EXCERPT) : '');
-    return store.createFile({
-      id,
-      name: safeName(name),
-      mime: safeMime,
-      size: buffer.length,
-      path: stored,
-      kind,
-      excerpt: text,
-      projectId,
-      generationId,
-    });
+    try {
+      return store.createFile({
+        id,
+        name: safeName(name),
+        mime: safeMime,
+        size: buffer.length,
+        kind,
+        excerpt: text,
+        projectId,
+        generationId,
+        storageDriver: storage.kind,
+        storageKey: key,
+      });
+    } catch (error) {
+      // A row that cannot be written must not leave its bytes behind.
+      await storage.remove(key).catch(() => {});
+      throw error;
+    }
   }
 
-  /** Stores a generation output (a data URL) as a real file on disk. */
-  function writeDataUrl(store, { dataUrl, name = 'output', projectId = null, generationId = null }) {
+  /** Stores a generation output (a data URL) as a real object. */
+  async function writeDataUrl(store, { dataUrl, name = 'output', projectId = null, generationId = null }) {
     const match = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(String(dataUrl || ''));
     if (!match) return null;
     const mime = match[1].toLowerCase();
     const payload = match[2] ? Buffer.from(match[3], 'base64') : Buffer.from(decodeURIComponent(match[3]), 'utf8');
     const extension = EXTENSIONS[mime] || '.bin';
     try {
-      return write(store, { name: `${name}${extension}`, mime, buffer: payload, kind: 'output', projectId, generationId });
+      return await write(store, { name: `${name}${extension}`, mime, buffer: payload, kind: 'output', projectId, generationId });
     } catch (error) {
       // A generated asset that cannot be stored must not lose the generation.
       console.warn('Could not persist generated asset:', error.message);
@@ -163,36 +177,62 @@ export function createFileStore({ db, uploadDir }) {
     }
   }
 
-  async function readFile(row) {
-    try {
-      return await fsp.readFile(absolutePath(row));
-    } catch {
-      throw new ProviderError('That file is no longer on disk', { status: 404, code: 'file_missing' });
-    }
+  /** Reads a row's bytes from whichever driver holds them. */
+  async function read(row) {
+    const key = keyOf(row);
+    if (!key) throw new ProviderError('That file has no stored location', { status: 500, code: 'file_unreadable' });
+    return driverFor(row).get(key);
   }
 
-  function remove(store, id) {
+  async function remove(store, id) {
     const row = store.getFileRow?.(id) || store.getFile(id);
     if (!row) return false;
-    try {
-      fs.rmSync(absolutePath(row), { force: true });
-    } catch (error) {
-      console.warn('Could not remove file from disk:', error.message);
-    }
+    const key = keyOf(row);
+    // The row goes first: an orphaned object is cheaper than a row pointing at
+    // nothing, and a failed delete would otherwise strand a file the user
+    // believes they removed.
     store.deleteFile(id);
+    await driverFor(row).remove(key).catch((error) => {
+      console.warn(`Could not remove ${key} from storage:`, error.message);
+    });
     return true;
   }
+
+  /** True when the row's driver is available (used by the storage diagnostics). */
+  const driverAvailable = (name) => Boolean(storage.drivers[name || 'local']);
 
   return {
     forWorkspace,
     /** Reads a row that is already known to belong to the caller's workspace. */
-    read: readFile,
-    pathOf: absolutePath,
-    /** Disk usage for a workspace: rows in, bytes out. */
+    read,
+    driverFor,
+    driverAvailable,
+    /**
+     * Deletes every object a workspace owns. Called before the workspace row is
+     * removed, because the rows that name the objects go with it.
+     */
+    async purgeWorkspace(store) {
+      const rows = store.listFiles({ limit: 10_000 });
+      let removed = 0;
+      const failed = [];
+      for (const row of rows) {
+        const key = keyOf(row);
+        try {
+          if (driverAvailable(driverOf(row))) await storage.for(driverOf(row)).remove(key);
+          removed += 1;
+        } catch (error) {
+          failed.push(`${key}: ${error.message}`);
+        }
+      }
+      return { removed, failed, bytes: rows.reduce((total, row) => total + (row.size || 0), 0) };
+    },
+    /** Bytes and object counts for a workspace: rows in, totals out. */
     statsFor(store) {
-      const rows = store.listFiles({ limit: 1000 });
+      const rows = store.listFiles({ limit: 10_000 });
       return { count: rows.length, bytes: rows.reduce((total, row) => total + (row.size || 0), 0) };
     },
+    describe: () => storage.describe(),
+    check: () => storage.check(),
   };
 }
 
