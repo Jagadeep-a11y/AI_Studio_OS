@@ -9,7 +9,12 @@ import { AUTOMATION_TEMPLATES } from './seed.js';
  * history would stop being trustworthy — which is the only reason to have one.
  */
 export function createAutomationRunner({ store, gateway }) {
-  async function execute({ automation, source = 'manual', project = null, signal = null }) {
+  /**
+   * `data` is a workspace-scoped store. Every caller passes one, so a scheduled
+   * run writes into the workspace that owns the automation and nowhere else.
+   */
+  async function execute({ automation, source = 'manual', project = null, signal = null, data }) {
+    const store = data;
     const template = AUTOMATION_TEMPLATES[automation.action];
 
     // Workspace chores have no generator step yet: say so instead of pretending.

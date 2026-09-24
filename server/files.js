@@ -94,7 +94,7 @@ export function safeName(filename) {
 
 // --- storage ----------------------------------------------------------------
 
-export function createFileStore({ db, store, uploadDir }) {
+export function createFileStore({ db, uploadDir }) {
   fs.mkdirSync(uploadDir, { recursive: true });
 
   const absolutePath = (row) => {
@@ -103,7 +103,18 @@ export function createFileStore({ db, store, uploadDir }) {
     return path.join(uploadDir, path.basename(stored));
   };
 
-  function write({ name, mime, buffer, kind = 'attachment', projectId = null, generationId = null, excerpt = '' }) {
+  /** A file store bound to one workspace's data layer. */
+  function forWorkspace(store) {
+    return {
+      write: (file) => write(store, file),
+      writeDataUrl: (input) => writeDataUrl(store, input),
+      readLink: (row) => absolutePath(row),
+      read: (row) => readFile(row),
+      remove: (id) => remove(store, id),
+    };
+  }
+
+  function write(store, { name, mime, buffer, kind = 'attachment', projectId = null, generationId = null, excerpt = '' }) {
     if (!buffer?.length) throw new ProviderError('The file is empty', { status: 400, code: 'empty_file' });
     if (buffer.length > MAX_FILE_BYTES) {
       throw new ProviderError(`${safeName(name)} is larger than ${humanSize(MAX_FILE_BYTES)}`, { status: 413, code: 'file_too_large' });
@@ -137,14 +148,14 @@ export function createFileStore({ db, store, uploadDir }) {
   }
 
   /** Stores a generation output (a data URL) as a real file on disk. */
-  function writeDataUrl({ dataUrl, name = 'output', projectId = null, generationId = null }) {
+  function writeDataUrl(store, { dataUrl, name = 'output', projectId = null, generationId = null }) {
     const match = /^data:([^;,]+)(;base64)?,(.*)$/s.exec(String(dataUrl || ''));
     if (!match) return null;
     const mime = match[1].toLowerCase();
     const payload = match[2] ? Buffer.from(match[3], 'base64') : Buffer.from(decodeURIComponent(match[3]), 'utf8');
     const extension = EXTENSIONS[mime] || '.bin';
     try {
-      return write({ name: `${name}${extension}`, mime, buffer: payload, kind: 'output', projectId, generationId });
+      return write(store, { name: `${name}${extension}`, mime, buffer: payload, kind: 'output', projectId, generationId });
     } catch (error) {
       // A generated asset that cannot be stored must not lose the generation.
       console.warn('Could not persist generated asset:', error.message);
@@ -152,32 +163,33 @@ export function createFileStore({ db, store, uploadDir }) {
     }
   }
 
+  async function readFile(row) {
+    try {
+      return await fsp.readFile(absolutePath(row));
+    } catch {
+      throw new ProviderError('That file is no longer on disk', { status: 404, code: 'file_missing' });
+    }
+  }
+
+  function remove(store, id) {
+    const row = store.getFileRow?.(id) || store.getFile(id);
+    if (!row) return false;
+    try {
+      fs.rmSync(absolutePath(row), { force: true });
+    } catch (error) {
+      console.warn('Could not remove file from disk:', error.message);
+    }
+    store.deleteFile(id);
+    return true;
+  }
+
   return {
-    write,
-    writeDataUrl,
-    readLink(row) {
-      return absolutePath(row);
-    },
-    async read(row) {
-      try {
-        return await fsp.readFile(absolutePath(row));
-      } catch {
-        throw new ProviderError('That file is no longer on disk', { status: 404, code: 'file_missing' });
-      }
-    },
-    remove(id) {
-      const row = store.getFile(id) || store.getFileRow?.(id);
-      if (!row) return false;
-      try {
-        fs.rmSync(absolutePath(row), { force: true });
-      } catch (error) {
-        console.warn('Could not remove file from disk:', error.message);
-      }
-      store.deleteFile(id);
-      return true;
-    },
-    /** Used by the tests and by `npm run clean` style tooling. */
-    stats() {
+    forWorkspace,
+    /** Reads a row that is already known to belong to the caller's workspace. */
+    read: readFile,
+    pathOf: absolutePath,
+    /** Disk usage for a workspace: rows in, bytes out. */
+    statsFor(store) {
       const rows = store.listFiles({ limit: 1000 });
       return { count: rows.length, bytes: rows.reduce((total, row) => total + (row.size || 0), 0) };
     },
@@ -190,7 +202,7 @@ export function createFileStore({ db, store, uploadDir }) {
  * Turns stored attachments into the shape providers expect: images as data
  * URLs, documents as text the prompt can quote.
  */
-export async function buildAttachments(fileStore, rows, { maxImages = 4, maxTextChars = 12_000 } = {}) {
+export async function buildAttachments(scopedFiles, rows, { maxImages = 4, maxTextChars = 12_000 } = {}) {
   const attachments = [];
   let textBudget = maxTextChars;
   let images = 0;
@@ -199,7 +211,7 @@ export async function buildAttachments(fileStore, rows, { maxImages = 4, maxText
     if (row.isImage) {
       if (images >= maxImages) continue;
       images += 1;
-      const data = await fileStore.read(row);
+      const data = await scopedFiles.read(row);
       attachments.push({ id: row.id, name: row.name, mime: row.mime, kind: 'image', dataUrl: `data:${row.mime};base64,${data.toString('base64')}`, bytes: row.size });
       continue;
     }

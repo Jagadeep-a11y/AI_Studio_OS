@@ -14,6 +14,7 @@
     models: 'Models',
     prompts: 'Prompt library',
     automations: 'Automations',
+    team: 'Team',
     usage: 'Usage & billing',
     settings: 'Settings',
   };
@@ -139,6 +140,11 @@
         error.hint = payload?.error?.hint || '';
         error.code = payload?.error?.code || 'request_failed';
         error.status = response.status;
+        // The session went away (expired, signed out elsewhere, password changed).
+        if (response.status === 401 && state.session.user) {
+          state.session = { ...state.session, user: null, role: null };
+          showAuthGate({ message: 'Your session ended. Sign in again to continue.' });
+        }
         throw error;
       }
       return payload;
@@ -193,6 +199,8 @@
     popover: null,
     settingsTab: 'Profile',
     notificationsRead: false,
+    session: { user: null, role: null, canWrite: false, canManage: false, workspaces: [], members: [], invites: [], assignableRoles: [] },
+    auth: { mode: 'signin', firstRun: false, claimable: [], signupsOpen: true, invite: null, inviteToken: '', error: '', busy: false },
     attachments: [],       // reference files waiting to be sent with a prompt
     uploads: [],           // files stored on the server for this workspace
     models: null,          // live catalogue once the server answers
@@ -228,6 +236,120 @@
     try { localStorage.setItem(key, JSON.stringify(value)); } catch (error) { /* Private browsing may disable storage. */ }
   }
 
+  // -------------------------------------------------------------------------
+  // Accounts: who is looking at the studio, and what they may do
+  // -------------------------------------------------------------------------
+
+  const initialsOf = (name = '') => String(name).trim().split(/\s+/).slice(0, 2).map((part) => part[0] || '').join('').toUpperCase() || '·';
+  const roleLabel = (role = '') => ({ owner: 'Owner', admin: 'Admin', editor: 'Editor', viewer: 'Viewer' }[role] || 'Member');
+  const signedIn = () => Boolean(state.session.user);
+  // Offline (no server) keeps the original single-user prototype behaviour.
+  const canWrite = () => (api.online ? state.session.canWrite : true);
+  const canManage = () => (api.online ? state.session.canManage : true);
+  const isOwner = () => (api.online ? state.session.role === 'owner' : true);
+
+  function roleSummary(role = state.session.role) {
+    return {
+      owner: 'Full control, including billing and who stays.',
+      admin: 'Can invite people, change roles, and do everything an editor can.',
+      editor: 'Can create projects, upload references, and run generations.',
+      viewer: 'Read-only access to this workspace.',
+    }[role] || 'Member of this workspace.';
+  }
+
+  /**
+   * The sign-in gate. It is the only screen shown before the shell loads, and it
+   * doubles as the invite-acceptance screen when the URL carries ?invite=<token>.
+   */
+  function renderAuthGate() {
+    const card = document.getElementById('auth-card');
+    const screen = document.getElementById('auth-screen');
+    if (!card || !screen) return;
+    const { mode, firstRun, claimable, signupsOpen, invite, error, busy } = state.auth;
+    screen.hidden = false;
+
+    if (invite) {
+      const existing = invite.existingAccount;
+      card.innerHTML = `
+        <div class="auth-eyebrow">${icon('users')} You are invited</div>
+        <h1>Join <em>${escapeHTML(invite.workspace.name)}</em></h1>
+        <p class="auth-lede">${escapeHTML(invite.invitedBy || 'A teammate')} invited <strong>${escapeHTML(invite.email)}</strong> to this workspace as ${escapeHTML(roleLabel(invite.role).toLowerCase())}. ${escapeHTML(roleSummary(invite.role.toLowerCase()))}</p>
+        ${existing
+          ? `<p class="auth-lede">You already have a Studio account for this address. ${
+            signedIn() ? 'Accept below and the workspace is added to your account.' : 'Sign in with your existing password to accept.'}</p>
+            <form id="invite-form" class="auth-form">
+              ${signedIn() ? '' : `<div class="form-field"><label for="auth-password">Your password</label><input id="auth-password" name="password" type="password" autocomplete="current-password" required /></div>`}
+              <div class="auth-error" ${error ? '' : 'hidden'}>${escapeHTML(error)}</div>
+              <button class="primary-button auth-submit" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Joining…' : 'Accept the invite'}</button>
+            </form>`
+          : `<form id="invite-form" class="auth-form">
+              <div class="form-field"><label for="auth-name">Your name</label><input id="auth-name" name="name" autocomplete="name" placeholder="What should teammates call you?" required /></div>
+              <div class="form-field"><label for="auth-password">Choose a password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" placeholder="At least 8 characters" required minlength="8" /></div>
+              <div class="auth-error" ${error ? '' : 'hidden'}>${escapeHTML(error)}</div>
+              <button class="primary-button auth-submit" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Joining…' : 'Create account and join'}</button>
+            </form>`}
+        <p class="auth-foot"><button type="button" class="link-button" data-action="auth-skip-invite">Carry on without joining</button></p>`;
+      return;
+    }
+
+    const signup = mode === 'signup';
+    card.innerHTML = `
+      <div class="auth-eyebrow">${icon(signup ? 'sparkles' : 'shield')} ${signup ? 'Create your account' : 'Welcome back'}</div>
+      <h1>${signup ? 'Start your <em>studio</em>' : 'Sign in to your <em>studio</em>'}</h1>
+      <p class="auth-lede">${signup
+        ? firstRun
+          ? `This is the first account on this server, so it will claim the workspace that is already here: <strong>${escapeHTML(claimable[0]?.name || 'Northstar Studio')}</strong>.`
+          : 'Your own workspace is created for you, separate from every other account.'
+        : 'Workspaces, projects, and generations live on this server. Sign in to pick up where you left off.'}</p>
+      ${!signup && !signupsOpen ? '' : ''}
+      <form id="auth-form" class="auth-form">
+        ${signup ? `<div class="form-field"><label for="auth-name">Your name</label><input id="auth-name" name="name" autocomplete="name" placeholder="Studio owner" required /></div>` : ''}
+        <div class="form-field"><label for="auth-email">Email</label><input id="auth-email" name="email" type="email" autocomplete="username" placeholder="you@studio.com" required /></div>
+        <div class="form-field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="${signup ? 'new-password' : 'current-password'}" placeholder="${signup ? 'At least 8 characters' : 'Your password'}" required ${signup ? 'minlength="8"' : ''} /></div>
+        <div class="auth-error" ${error ? '' : 'hidden'}>${escapeHTML(error)}</div>
+        <button class="primary-button auth-submit" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'One moment…' : signup ? 'Create account' : 'Sign in'}</button>
+      </form>
+      <p class="auth-foot">${signup
+        ? 'Already have an account? <button type="button" class="link-button" data-action="auth-mode" data-mode="signin">Sign in</button>'
+        : 'New here? <button type="button" class="link-button" data-action="auth-mode" data-mode="signup">Create an account</button>'}</p>
+      ${api.online ? '' : '<p class="auth-foot auth-offline">The Studio server is unreachable — start it with <code>npm start</code>.</p>'}`;
+  }
+
+  function showAuthGate({ message = '', mode = '' } = {}) {
+    if (mode) state.auth.mode = mode;
+    if (message) state.auth.error = message;
+    document.body.classList.add('is-locked');
+    renderAuthGate();
+  }
+
+  function hideAuthGate() {
+    state.auth.error = '';
+    state.auth.busy = false;
+    document.body.classList.remove('is-locked');
+    const screen = document.getElementById('auth-screen');
+    if (screen) screen.hidden = true;
+  }
+
+  /** Reads `?invite=…` so an invitation link opens the right screen. */
+  function inviteTokenFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('invite') || params.get('invite_token') || '';
+  }
+
+  async function loadInvite(token) {
+    try {
+      const payload = await api.request(`/api/invites/${encodeURIComponent(token)}`);
+      state.auth.inviteToken = token;
+      state.auth.invite = { ...payload.invite, workspace: payload.workspace, invitedBy: payload.invitedBy, existingAccount: payload.existingAccount };
+      showAuthGate({ message: '' });
+      return true;
+    } catch (error) {
+      state.auth.invite = null;
+      showAuthGate({ message: `That invite link cannot be used: ${error.message}` });
+      return false;
+    }
+  }
+
   const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   const icon = (name, extraClass = '') => `<svg class="icon ${extraClass}" aria-hidden="true"><use href="#i-${escapeHTML(name)}"></use></svg>`;
 
@@ -252,6 +374,7 @@
   async function uploadAttachments(fileList) {
     const picked = Array.from(fileList || []).slice(0, 8);
     if (!picked.length) return;
+    if (blockedWrite()) return;
     if (!api.online) {
       showToast('Start the Studio server (npm start) to attach reference files.', 'error');
       return;
@@ -296,6 +419,7 @@
   function updateShell() {
     const pageNameNode = document.getElementById('current-page-name');
     if (pageNameNode) pageNameNode.textContent = currentPageName();
+    updateAccountChrome();
     document.title = `${currentPageName()} · AI Studio OS`;
     document.querySelectorAll('.sidebar .nav-link[data-page]').forEach((item) => {
       item.classList.toggle('is-active', item.dataset.page === state.page);
@@ -307,6 +431,48 @@
     if (credits) {
       const used = state.usage?.plan?.creditsUsed ?? 6820;
       credits.textContent = used.toLocaleString('en-US');
+    }
+  }
+
+  /**
+   * Everything in the shell that depends on who is signed in and which workspace
+   * is active. Called by updateShell, so it stays in step with every render.
+   */
+  function updateAccountChrome() {
+    const workspace = state.session.workspace;
+    const user = state.session.user;
+
+    const setText = (id, value) => {
+      const node = document.getElementById(id);
+      if (node) node.textContent = value;
+    };
+    setText('workspace-initial', workspace ? initialsOf(workspace.name).slice(0, 1) : 'N');
+    setText('workspace-name', workspace ? workspace.name : 'Northstar Studio');
+    setText('workspace-note', workspace ? `${roleLabel(state.session.role)} · ${state.session.workspaces.length} workspace${state.session.workspaces.length === 1 ? '' : 's'}` : 'Offline workspace');
+    setText('breadcrumb-workspace', workspace ? workspace.name : 'Northstar Studio');
+    setText('profile-name', user ? user.name : 'Alex Chen');
+    setText('profile-role', user ? `${roleLabel(state.session.role)}${workspace ? ` · ${workspace.name}` : ''}` : 'Pro member');
+    setText('profile-avatar', user ? initialsOf(user.name) : 'AC');
+    setText('topbar-avatar', user ? initialsOf(user.name) : 'AC');
+
+    const members = state.session.members || [];
+    const count = document.getElementById('member-count');
+    if (count) {
+      count.textContent = String(members.length || 1);
+      count.hidden = !signedIn();
+    }
+
+    const pill = document.getElementById('role-pill');
+    if (pill) {
+      const readOnly = api.online && signedIn() && !canWrite();
+      pill.hidden = !api.online || !signedIn();
+      pill.textContent = readOnly ? `${roleLabel(state.session.role)} · read only` : `Signed in as ${roleLabel(state.session.role)}`;
+      pill.classList.toggle('is-readonly', readOnly);
+    }
+    if (user && api.online) {
+      document.body.classList.toggle('is-readonly', !canWrite());
+    } else {
+      document.body.classList.remove('is-readonly');
     }
     updateEnvPill();
   }
@@ -356,12 +522,14 @@
       models: renderModelsPage,
       prompts: renderPromptsPage,
       automations: renderAutomationsPage,
+      team: renderTeamPage,
       usage: renderUsagePage,
       settings: renderSettingsPage,
     };
     content.innerHTML = (renderers[state.page] || renderDashboard)();
     updateShell();
     if (state.page === 'automations') loadAutomationRuns();
+    if (state.page === 'team') loadMembers();
     if (state.page === 'settings' && state.settingsTab === 'Connections') loadWorkspaceFiles();
   }
 
@@ -423,7 +591,8 @@
         <div class="hero-copy"><div class="hero-eyebrow">${icon('sparkles')} One studio. Every model.</div><h2 id="hero-heading">Turn a spark into <em>something real.</em></h2><p class="hero-subtitle">Start with a thought. Your best tools are already here.</p></div>
         <div class="hero-art" aria-hidden="true"><span class="hero-orbit"></span><span class="hero-orb"></span><span class="hero-spark">✳</span><span class="hero-note">${icon('lightning')} A little more flow</span></div>
       </div>
-      <form class="prompt-box" id="prompt-form">
+      ${api.online && signedIn() && !canWrite() ? `<div class="readonly-note">${icon('shield')}<div><strong>Read-only access.</strong> Your role in ${escapeHTML(state.session.workspace?.name || 'this workspace')} is ${escapeHTML(roleLabel(state.session.role).toLowerCase())}, so you can browse everything but not create or generate.</div></div>` : ''}
+      <form class="prompt-box" id="prompt-form" ${api.online && signedIn() && !canWrite() ? 'hidden' : ''}>
         <label class="sr-only" for="main-prompt">Describe what you want to create</label>
         <textarea id="main-prompt" name="prompt" rows="2" placeholder="Describe an idea, paste a brief, or drop a task to get started..."></textarea>
         ${attachmentStripHTML()}
@@ -701,27 +870,130 @@
       <div class="section-head"><div><h2>Recent usage</h2><p class="section-subtitle">Every generation, newest first.</p></div></div><div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>ACTIVITY</th><th>MODEL</th><th>PROJECT</th><th>DATE</th><th>CREDITS</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
 
+  /** The Team page: who is here, what they may do, and who is invited. */
+  function renderTeamPage() {
+    const members = state.session.members || [];
+    const invites = state.session.invites || [];
+    const manager = canManage();
+    const roleOptions = (selected, allowed) => ['owner', 'admin', 'editor', 'viewer']
+      .filter((role) => role !== 'owner' && (!allowed || allowed.includes(role)))
+      .map((role) => `<option value="${role}" ${selected === role ? 'selected' : ''}>${roleLabel(role)}</option>`).join('');
+
+    const memberRows = members.map((member) => {
+      const isSelf = member.userId === state.session.user?.id;
+      const editable = manager && member.role !== 'owner' && !(state.session.role === 'admin' && member.role === 'admin');
+      return `<div class="member-row" data-member="${escapeHTML(member.userId)}">
+        <span class="member-avatar">${escapeHTML(initialsOf(member.name))}</span>
+        <div class="member-main">
+          <h3>${escapeHTML(member.name)} ${isSelf ? '<span class="badge badge-soft">YOU</span>' : ''}</h3>
+          <p>${escapeHTML(member.email)} · joined ${escapeHTML(member.joinedLabel || 'today')}</p>
+        </div>
+        <div class="member-side">
+          ${editable
+            ? `<label class="sr-only" for="role-${escapeHTML(member.userId)}">Role for ${escapeHTML(member.name)}</label>
+               <select id="role-${escapeHTML(member.userId)}" class="role-select" data-action="change-role" data-id="${escapeHTML(member.userId)}">${roleOptions(member.role, state.session.assignableRoles)}</select>`
+            : `<span class="badge ${member.role === 'owner' ? 'badge-live' : 'badge-soft'}">${escapeHTML(roleLabel(member.role).toUpperCase())}</span>`}
+          ${isSelf || !manager || member.role === 'owner' ? '' : `<button class="quiet-button" type="button" data-action="remove-member" data-id="${escapeHTML(member.userId)}" data-name="${escapeHTML(member.name)}" aria-label="Remove ${escapeHTML(member.name)}">${icon('trash')}</button>`}
+        </div>
+      </div>`;
+    }).join('');
+
+    const inviteRows = invites.length
+      ? invites.map((invite) => `<div class="invite-row">
+          <span class="member-avatar is-pending">${icon('clock')}</span>
+          <div class="member-main"><h3>${escapeHTML(invite.email)}</h3><p>Invited as ${escapeHTML(roleLabel(invite.role))} · ${escapeHTML(invite.expiresLabel || 'expires in 7 days')}</p></div>
+          <div class="member-side">
+            <button class="quiet-button" type="button" data-action="copy-invite" data-url="${escapeHTML(invite.acceptUrl || '')}" title="Copy the invite link">${icon('copy')}</button>
+            <button class="quiet-button" type="button" data-action="revoke-invite" data-id="${escapeHTML(invite.id)}" aria-label="Revoke the invite for ${escapeHTML(invite.email)}">${icon('close')}</button>
+          </div>
+        </div>`).join('')
+      : '<p class="section-subtitle">No invitations are waiting.</p>';
+
+    return `<section class="page-heading"><div><div class="eyebrow">Who is building with you</div><h1>Team</h1><p>Everyone here shares this workspace. Roles decide what each person can do.</p></div>
+      ${manager ? `<button class="primary-button" type="button" data-action="invite-modal">${icon('plus')} Invite someone</button>` : ''}</section>
+
+      <div class="team-grid">
+        <section class="settings-card">
+          <div class="card-head"><div><h2>${members.length} member${members.length === 1 ? '' : 's'}</h2><p>${escapeHTML(roleSummary())}</p></div><span class="badge badge-soft">${escapeHTML(roleLabel(state.session.role).toUpperCase())}</span></div>
+          <div class="member-list">${memberRows || '<p class="section-subtitle">You are the only person here.</p>'}</div>
+        </section>
+
+        <section class="settings-card">
+          <div class="card-head"><div><h2>Roles</h2><p>What each level can do.</p></div></div>
+          <ul class="role-legend">
+            <li><span class="badge badge-live">OWNER</span><span>Full control. Only an owner can delete the workspace or hand it over.</span></li>
+            <li><span class="badge badge-soft">ADMIN</span><span>Invite editors and viewers, change roles, manage the workspace.</span></li>
+            <li><span class="badge badge-soft">EDITOR</span><span>Create projects, upload references, run generations and automations.</span></li>
+            <li><span class="badge badge-soft">VIEWER</span><span>Read everything, change nothing.</span></li>
+          </ul>
+        </section>
+      </div>
+
+      <section class="settings-card" style="margin-top:16px">
+        <div class="card-head"><div><h2>Pending invites</h2><p>${manager ? 'Nothing is emailed in this build — share the link yourself.' : 'Only owners and admins can invite people.'}</p></div></div>
+        ${manager ? inviteRows : '<p class="section-subtitle">Ask an owner or admin if you need someone added.</p>'}
+      </section>`;
+  }
+
+  function inviteModal() {
+    const allowed = state.session.assignableRoles?.length ? state.session.assignableRoles : ['admin', 'editor', 'viewer'];
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="invite-title"><div class="modal-header"><div><h2 id="invite-title">Invite someone to ${escapeHTML(state.session.workspace?.name || 'this workspace')}</h2><p>They join with their own account — no password sharing.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="invite-form-modal"><div class="modal-body"><div class="form-field"><label for="invite-email">Email address</label><input id="invite-email" name="email" type="email" placeholder="teammate@studio.com" required /></div><div class="form-field"><label for="invite-role">Role</label><select id="invite-role" name="role">${allowed.map((role) => `<option value="${role}">${roleLabel(role)} — ${escapeHTML(roleSummary(role))}</option>`).join('')}</select></div><p class="section-subtitle">The invite link is valid for seven days and can be revoked at any time.</p></div><div class="modal-footer"><span class="modal-note">The link appears here once it is created.</span><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create invite ${icon('arrow-right')}</button></div></form></section></div>`, 'invite', { focus: '#invite-email' });
+  }
+
+  function inviteLinkModal({ email, role, acceptUrl, expiresInDays }) {
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="invite-link-title"><div class="modal-header"><div><h2 id="invite-link-title">Invite ready</h2><p>Send this link to ${escapeHTML(email)}. It expires in ${escapeHTML(String(expiresInDays || 7))} days.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><div class="modal-body"><div class="form-field"><label for="invite-link">Invite link</label><input id="invite-link" value="${escapeHTML(acceptUrl)}" readonly /></div><div class="detail-tags"><span class="detail-tag">${escapeHTML(roleLabel(role))}</span><span class="detail-tag">${escapeHTML(state.session.workspace?.name || '')}</span></div><p class="section-subtitle">They will be asked to create an account (or sign in) and then land straight in this workspace.</p></div><div class="modal-footer"><button class="secondary-button" type="button" data-action="close-modal">Done</button><button class="primary-button" type="button" data-action="copy-invite" data-url="${escapeHTML(acceptUrl)}">${icon('copy')} Copy link</button></div></section></div>`, 'invite-link', { focus: '#invite-link' });
+  }
+
   function renderSettingsPage() {
     const tabs = ['Profile', 'Workspace', 'Preferences', 'Connections'];
+    const user = state.session.user;
+    const workspace = state.session.workspace;
     let fields = '';
+
     if (state.settingsTab === 'Profile') {
-      fields = `<div class="form-row"><div class="form-field"><label for="settings-name">Full name</label><input id="settings-name" name="name" value="${escapeHTML(state.settings.name)}" /></div><div class="form-field"><label for="settings-email">Email address</label><input id="settings-email" name="email" type="email" value="${escapeHTML(state.settings.email)}" /></div></div><div class="form-field"><label for="settings-role">Role</label><input id="settings-role" value="Creative lead" disabled /></div>`;
+      fields = `<div class="form-row"><div class="form-field"><label for="settings-name">Full name</label><input id="settings-name" name="name" value="${escapeHTML(user?.name || state.settings.name)}" /></div><div class="form-field"><label for="settings-email">Email address</label><input id="settings-email" value="${escapeHTML(user?.email || state.settings.email)}" disabled /></div></div>
+        <div class="form-field"><label for="settings-role">Your role here</label><input id="settings-role" value="${escapeHTML(roleLabel(state.session.role))}" disabled /></div>`;
     } else if (state.settingsTab === 'Workspace') {
-      fields = `<div class="form-field"><label for="settings-workspace">Workspace name</label><input id="settings-workspace" name="workspace" value="${escapeHTML(state.settings.workspace)}" /></div><div class="form-field"><label for="settings-workspace-type">Workspace type</label><select id="settings-workspace-type"><option>Personal workspace</option><option>Team workspace</option></select></div><div class="form-field"><label for="settings-workspace-description">About this workspace</label><textarea id="settings-workspace-description" placeholder="What are you making together?">A small, curious studio for good ideas.</textarea></div>`;
+      const owner = isOwner();
+      fields = `<div class="form-field"><label for="settings-workspace">Workspace name</label><input id="settings-workspace" name="workspace" value="${escapeHTML(workspace?.name || state.settings.workspace)}" ${canManage() ? '' : 'disabled'} /></div>
+        <div class="form-field"><label for="settings-workspace-id">Workspace id</label><input id="settings-workspace-id" value="${escapeHTML(workspace?.id || 'offline')}" disabled /></div>
+        <p class="section-subtitle">${owner ? 'You own this workspace. Deleting it removes every project, generation, and file inside it.' : `Ask ${escapeHTML(membersOwnerName())} to rename or delete this workspace.`}</p>
+        ${owner && state.session.workspaces.length > 1 ? `<div class="danger-zone">
+          <div><h3>Delete this workspace</h3><p>Every project, generation, and file in <strong>${escapeHTML(workspace?.name || '')}</strong> is removed for everyone. This cannot be undone.</p></div>
+          <button class="danger-button" type="button" data-action="delete-workspace">${icon('trash')} Delete workspace</button>
+        </div>` : ''}
+        ${state.session.workspaces.length <= 1 && owner ? '<p class="section-subtitle">A workspace you are alone in cannot be deleted — it is the only place your work lives.</p>' : ''}`;
     } else if (state.settingsTab === 'Preferences') {
-      fields = `<div class="form-field"><label for="settings-timezone">Time zone</label><select id="settings-timezone" name="timezone"><option ${state.settings.timezone === 'Asia/Kolkata' ? 'selected' : ''}>Asia/Kolkata</option><option>America/Los_Angeles</option><option>Europe/London</option><option>UTC</option></select></div><div class="form-field"><label for="settings-start-page">Start page</label><select id="settings-start-page"><option>Overview</option><option>Projects</option><option>Canvas</option></select></div><p class="section-subtitle">Keyboard shortcut: press Ctrl / ⌘ + K to search, create, or jump anywhere.</p>`;
+      fields = `<div class="form-field"><label for="settings-timezone">Time zone</label><select id="settings-timezone" name="timezone"><option ${state.settings.timezone === 'Asia/Kolkata' ? 'selected' : ''}>Asia/Kolkata</option><option>America/Los_Angeles</option><option>Europe/London</option><option>UTC</option></select></div><div class="form-field"><label for="settings-start-page">Start page</label><select id="settings-start-page"><option>Overview</option><option>Projects</option><option>Canvas</option></select></div><p class="section-subtitle">Schedules follow this time zone. Keyboard shortcut: press Ctrl / ⌘ + K to search, create, or jump anywhere.</p>`;
     }
+
     const iconFor = (tab) => ({ Profile: 'file', Workspace: 'folder', Preferences: 'settings', Connections: 'lightning' }[tab]);
     const connectionPanel = `<h2>Generation connections</h2><p>Keys are read from <code>.env</code> on the server. This page never sees them.</p>${api.online ? `<div class="provider-list" style="margin-top:14px">${providerRowsHTML({ showProbe: true })}</div><div style="margin-top:14px">${nextStepHTML()}</div>` : `<div class="output-notice" style="margin-top:14px">${icon('close')}<div>The Studio server is not reachable, so no connections can be inspected. Run <code>npm start</code> and reconnect.</div></div><button class="secondary-button" type="button" data-action="reconnect-backend" style="margin-top:12px">${icon('refresh')} Reconnect</button>`}
     ${api.online ? `<h2 style="margin-top:18px">Automation scheduler</h2>
       <div class="scheduler-note">${icon('clock')}<span>${escapeHTML(schedulerHeadline())} · ${escapeHTML(schedulerDetail())}</span></div>
       <p>Due workflows are claimed by the server before they run, so a restart never double-fires one. A window missed while the server was off runs once on the next check — never a backlog.</p>
-      <p>Storage: ${(state.uploads || []).length} file${(state.uploads || []).length === 1 ? '' : 's'} on disk in <code>data/uploads</code>. Generated images are saved as files instead of data URLs inside the database.</p>` : ''};`
+      <p>Storage: ${(state.uploads || []).length} file${(state.uploads || []).length === 1 ? '' : 's'} on disk in <code>data/uploads</code>. Generated images are saved as files instead of data URLs inside the database.</p>` : ''}`;
 
-    return `<section class="page-heading"><div><div class="eyebrow">Make the studio yours</div><h1>Settings</h1><p>Manage your profile and the way your workspace feels.</p></div></section><div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections">${tabs.map((tab) => `<button type="button" class="${state.settingsTab === tab ? 'is-active' : ''}" data-action="settings-tab" data-tab="${escapeHTML(tab)}">${icon(iconFor(tab))}${escapeHTML(tab)}</button>`).join('')}</nav><section class="settings-card">${state.settingsTab === 'Connections'
+    // Account security is its own form: it must not travel with profile edits.
+    const passwordPanel = state.settingsTab === 'Profile' && signedIn() && api.online
+      ? `<h2 style="margin-top:20px">Password</h2><p>Changing your password signs out every other session.</p>
+        <form id="password-form"><div class="form-row"><div class="form-field"><label for="password-current">Current password</label><input id="password-current" name="currentPassword" type="password" autocomplete="current-password" required /></div><div class="form-field"><label for="password-next">New password</label><input id="password-next" name="password" type="password" autocomplete="new-password" minlength="8" required /></div></div>
+        <div class="modal-footer" style="padding:13px 0 0"><span class="modal-note">At least 8 characters.</span><button class="secondary-button" type="submit">Update password</button></div></form>`
+      : '';
+
+    const sessionPanel = state.settingsTab === 'Profile' && signedIn() && api.online
+      ? `<h2 style="margin-top:20px">Session</h2><p>Signed in as ${escapeHTML(user.email)} with ${escapeHTML(roleLabel(state.session.role).toLowerCase())} access to ${escapeHTML(workspace?.name || '')}.</p>
+        <div class="settings-actions"><button class="secondary-button" type="button" data-action="sign-out">${icon('logout')} Sign out</button>${state.session.role === 'owner' || canManage() ? `<button class="secondary-button" type="button" data-action="go-page" data-page="team">${icon('users')} Manage team</button>` : ''}</div>`
+      : '';
+
+    return `<section class="page-heading"><div><div class="eyebrow">Make the studio yours</div><h1>Settings</h1><p>Your account, your workspace, and the way it feels.</p></div></section><div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections">${tabs.map((tab) => `<button type="button" class="${state.settingsTab === tab ? 'is-active' : ''}" data-action="settings-tab" data-tab="${escapeHTML(tab)}">${icon(iconFor(tab))}${escapeHTML(tab)}</button>`).join('')}</nav><section class="settings-card">${state.settingsTab === 'Connections'
       ? connectionPanel
-      : `<h2>${escapeHTML(state.settingsTab)} settings</h2><p>Only you can see and manage these details.</p><form id="settings-form">${fields}<div class="modal-footer" style="padding:13px 0 0;margin-top:5px"><span class="modal-note">${api.online ? 'Saved to your workspace database.' : 'Changes save to this browser.'}</span><button class="primary-button" type="submit">Save changes</button></div></form>`}</section></div>`;
+      : state.settingsTab === 'Profile'
+        ? `<h2>Profile settings</h2><p>Your name is what teammates see across the workspace.</p><form id="settings-form">${fields}<div class="modal-footer" style="padding:13px 0 0;margin-top:5px"><span class="modal-note">${api.online ? 'Saved to your account.' : 'Changes save to this browser.'}</span><button class="primary-button" type="submit">Save changes</button></div></form>${passwordPanel}${sessionPanel}`
+        : `<h2>${escapeHTML(state.settingsTab)} settings</h2><p>${state.settingsTab === 'Workspace' ? 'Everything in the Studio belongs to a workspace.' : 'Only you can see and manage these details.'}</p><form id="settings-form">${fields}${state.settingsTab === 'Workspace' ? '' : ''}<div class="modal-footer" style="padding:13px 0 0;margin-top:5px"><span class="modal-note">${api.online ? 'Saved to your workspace database.' : 'Changes save to this browser.'}</span><button class="primary-button" type="submit" ${canManage() ? '' : 'disabled'}>Save changes</button></div></form>`}</section></div>`;
   }
+
+  const membersOwnerName = () => (state.session.members || []).find((member) => member.role === 'owner')?.name || 'the owner';
 
   function openModal(html, type = 'generic', options = {}) {
     closePopover();
@@ -901,11 +1173,28 @@
   }
 
   function workspaceMenu(anchor) {
-    placePopover(anchor, `<div class="popover-title">Your workspace</div><button class="popover-item" type="button" data-action="workspace-info">${icon('folder')}<span>Northstar Studio</span>${icon('check', 'popover-check')}</button><div class="popover-divider"></div><button class="popover-item" type="button" data-action="workspace-info">${icon('plus')}<span>Create a workspace</span></button><button class="popover-item" type="button" data-page="settings">${icon('settings')}<span>Workspace settings</span></button>`, 204);
+    const list = state.session.workspaces || [];
+    const active = state.session.workspace?.id;
+    const rows = list.length
+      ? list.map((workspace) => `<button class="popover-item" type="button" data-action="switch-workspace" data-id="${escapeHTML(workspace.id)}">${icon(workspace.id === active ? 'folder' : 'globe')}<span>${escapeHTML(workspace.name)}</span><small class="popover-hint">${escapeHTML(roleLabel(workspace.role))}</small>${workspace.id === active ? `<span class="popover-check">${icon('check')}</span>` : ''}</button>`).join('')
+      : `<div class="popover-empty">No workspace yet.</div>`;
+    placePopover(anchor, `<div class="popover-title">Your workspaces</div>${rows}<div class="popover-divider"></div>
+      <button class="popover-item" type="button" data-action="new-workspace">${icon('plus')}<span>New workspace</span></button>
+      <button class="popover-item" type="button" data-action="go-page" data-page="settings" data-tab="Workspace">${icon('settings')}<span>Workspace settings</span></button>`, 244);
   }
 
   function profileMenu(anchor) {
-    placePopover(anchor, `<div class="popover-title">Alex Chen · Pro member</div><button class="popover-item" type="button" data-page="settings">${icon('settings')}<span>Account settings</span></button><button class="popover-item" type="button" data-page="usage">${icon('wallet')}<span>Plan & billing</span></button><div class="popover-divider"></div><button class="popover-item" type="button" data-action="profile-info">${icon('help')}<span>About this prototype</span></button>`, 190);
+    const user = state.session.user;
+    placePopover(anchor, `<div class="popover-title">${escapeHTML(user ? user.name : 'Alex Chen')} · ${escapeHTML(api.online ? roleLabel(state.session.role) : 'Pro member')}</div>
+      <div class="popover-account">${escapeHTML(user?.email || 'Not signed in — running offline')}</div>
+      <button class="popover-item" type="button" data-action="go-page" data-page="settings" data-tab="Profile">${icon('settings')}<span>Account settings</span></button>
+      <button class="popover-item" type="button" data-action="go-page" data-page="team">${icon('users')}<span>Members & invites</span></button>
+      <button class="popover-item" type="button" data-action="go-page" data-page="usage">${icon('wallet')}<span>Plan & billing</span></button>
+      <div class="popover-divider"></div>
+      ${signedIn() && api.online
+        ? `<button class="popover-item popover-danger" type="button" data-action="sign-out">${icon('logout')}<span>Sign out</span></button>`
+        : `<button class="popover-item" type="button" data-action="auth-open">${icon('key')}<span>Sign in</span></button>`}
+      <button class="popover-item" type="button" data-action="profile-info">${icon('help')}<span>About this prototype</span></button>`, 236);
   }
 
   function artForType(type) {
@@ -919,6 +1208,7 @@
   }
 
   function createProject({ title, type = 'Campaign', model = state.selectedModel, prompt = '', toastMessage = '', toastKind = 'success' }) {
+    if (blockedWrite()) return false;
     const trimmedTitle = String(title || '').trim().slice(0, 72);
     if (!trimmedTitle) {
       showToast('Add a project name to get started.', 'error');
@@ -1116,6 +1406,7 @@
    * user watches the model work rather than a spinner.
    */
   async function startGeneration({ prompt, mode, model, projectId = null, title = '', fileIds = [] }) {
+    if (blockedWrite()) return;
     if (!api.online) {
       // No server: the brief is still worth keeping, and the message says why
       // nothing was generated rather than failing silently.
@@ -1191,6 +1482,24 @@
   }
 
   /** Applies whatever the server says changed, so the UI never drifts. */
+  /** Refreshes the member list and pending invites for the Team page. */
+  async function loadMembers({ announce = false } = {}) {
+    if (!api.online || !signedIn()) return null;
+    try {
+      const payload = await api.request('/api/members');
+      state.session.members = payload.members || [];
+      state.session.invites = payload.invites || [];
+      state.session.assignableRoles = payload.assignableRoles || state.session.assignableRoles;
+      if (payload.role) state.session.role = payload.role;
+      if (state.page === 'team') renderPage();
+      if (announce) showToast('Team updated.');
+      return payload;
+    } catch (error) {
+      showToast(error.message, 'error');
+      return null;
+    }
+  }
+
   function applyServerState(payload = {}) {
     if (Array.isArray(payload.projects)) state.projects = payload.projects;
     if (payload.project) {
@@ -1205,7 +1514,171 @@
     if (Array.isArray(payload.automations)) state.automations = payload.automations;
     if (Array.isArray(payload.files)) state.uploads = payload.files;
     if (payload.scheduler) state.scheduler = payload.scheduler;
+    if (payload.members) state.session.members = payload.members;
+    if (payload.invites) state.session.invites = payload.invites;
+    if (payload.assignableRoles) state.session.assignableRoles = payload.assignableRoles;
     updateShell();
+  }
+
+  // -------------------------------------------------------------------------
+  // Account actions: sign in and out, workspaces, members
+  // -------------------------------------------------------------------------
+
+  async function submitAuthGate(form) {
+    const data = new FormData(form);
+    const email = String(data.get('email') || '').trim();
+    const password = String(data.get('password') || '');
+    const name = String(data.get('name') || '').trim();
+    const signup = state.auth.mode === 'signup';
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) { submit.disabled = true; submit.textContent = 'One moment…'; }
+    try {
+      const payload = await api.request(signup ? '/api/auth/signup' : '/api/auth/login', {
+        method: 'POST',
+        body: signup ? { email, password, name } : { email, password },
+      });
+      api.online = true;
+      state.auth.error = '';
+      state.session.user = payload.user;
+      state.session.role = payload.workspace?.role || 'owner';
+      state.session.workspace = payload.workspace;
+      state.session.workspaces = payload.workspaces || [];
+      api.capabilities = payload.capabilities || api.capabilities;
+      hideAuthGate();
+      await bootstrap({ announce: false });
+      showToast(signup
+        ? (payload.claimed ? `Welcome to ${payload.workspace.name}.` : `Your workspace “${payload.workspace.name}” is ready.`)
+        : `Welcome back, ${payload.user.name.split(' ')[0]}.`);
+    } catch (error) {
+      state.auth.error = error.message;
+      state.auth.busy = false;
+      renderAuthGate();
+    }
+  }
+
+  async function submitInvite(form) {
+    const data = new FormData(form);
+    const password = String(data.get('password') || '');
+    const name = String(data.get('name') || '').trim();
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) { submit.disabled = true; submit.textContent = 'Joining…'; }
+    try {
+      const payload = await api.request(`/api/invites/${encodeURIComponent(state.auth.inviteToken)}/accept`, {
+        method: 'POST',
+        body: { name, password: password || undefined },
+      });
+      api.online = true;
+      state.session.user = payload.user;
+      state.session.workspace = payload.workspace;
+      state.session.workspaces = payload.workspaces || [];
+      state.auth.invite = null;
+      state.auth.inviteToken = '';
+      const url = new URL(window.location.href);
+      url.searchParams.delete('invite');
+      window.history.replaceState({}, '', url.pathname + url.search);
+      hideAuthGate();
+      await bootstrap({ announce: false });
+      showToast(`You joined ${payload.workspace.name} as ${roleLabel(payload.workspace.role).toLowerCase()}.`);
+    } catch (error) {
+      state.auth.error = error.message;
+      state.auth.busy = false;
+      renderAuthGate();
+    }
+  }
+
+  async function signOut() {
+    closePopover();
+    try { await api.request('/api/auth/logout', { method: 'POST' }); } catch (error) { /* the session is going away either way */ }
+    state.session = { user: null, role: null, canWrite: false, canManage: false, workspaces: [], members: [], invites: [], assignableRoles: [] };
+    state.projects = [];
+    state.activity = [];
+    state.uploads = [];
+    state.usage = null;
+    state.models = null;
+    api.online = false;
+    hideAuthGate();
+    state.auth.mode = 'signin';
+    showAuthGate({ message: 'Signed out. See you soon.' });
+  }
+
+  async function switchWorkspace(id) {
+    closePopover();
+    if (!id || id === state.session.workspace?.id) return;
+    try {
+      const payload = await api.request('/api/workspaces/switch', { method: 'POST', body: { workspaceId: id } });
+      state.session.workspace = payload.workspace;
+      state.session.role = payload.workspace.role;
+      state.session.members = payload.members || [];
+      state.session.invites = payload.invites || [];
+      state.session.workspaces = payload.workspaces || state.session.workspaces;
+      // Every workspace owns its own work, so nothing from the old one is kept.
+      state.projects = [];
+      state.activity = [];
+      state.uploads = [];
+      state.attachments = [];
+      await bootstrap({ announce: false });
+      state.page = 'overview';
+      window.location.hash = '#overview';
+      renderPage();
+      showToast(`Switched to ${payload.workspace.name}.`);
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
+  }
+
+  function newWorkspaceModal() {
+    closePopover();
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-modal-title"><div class="modal-header"><div><h2 id="workspace-modal-title">Create a workspace</h2><p>A separate place for projects, files, and people.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="create-workspace-form"><div class="modal-body"><div class="form-field"><label for="new-workspace-name">Workspace name</label><input id="new-workspace-name" name="name" placeholder="e.g. Side Projects" required maxlength="80" /></div><p class="section-subtitle">You will be its owner, and nothing from your current workspace is copied across.</p></div><div class="modal-footer"><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create workspace ${icon('arrow-right')}</button></div></form></section></div>`, 'new-workspace', { focus: '#new-workspace-name' });
+  }
+
+  async function changeMemberRole(userId, role, select) {
+    if (!userId || !role) return;
+    try {
+      const payload = await api.request(`/api/members/${encodeURIComponent(userId)}`, { method: 'PATCH', body: { role } });
+      state.session.members = payload.members || state.session.members;
+      renderPage();
+      showToast(`Role changed to ${roleLabel(role).toLowerCase()}.`);
+    } catch (error) {
+      showToast(error.message, 'error');
+      loadMembers();
+    }
+  }
+
+  function removeMember(userId, name) {
+    if (!userId) return;
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="remove-member-title"><div class="modal-header"><div><h2 id="remove-member-title">Remove ${escapeHTML(name || 'this person')}?</h2><p>They lose access to this workspace. Their account and their own workspaces stay.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><div class="modal-footer"><button class="secondary-button" type="button" data-action="close-modal">Keep them</button><button class="danger-button" type="button" data-action="confirm-remove-member" data-id="${escapeHTML(userId)}">Remove from workspace</button></div></section></div>`, 'remove-member');
+  }
+
+  function transferOwnershipModal() {
+    const candidates = (state.session.members || []).filter((member) => member.role !== 'owner');
+    if (!candidates.length) return showToast('There is nobody else in this workspace yet.', 'error');
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="transfer-title"><div class="modal-header"><div><h2 id="transfer-title">Hand over ownership</h2><p>The new owner controls who stays and whether the workspace is deleted. You keep admin access.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="transfer-form"><div class="modal-body"><div class="form-field"><label for="transfer-target">New owner</label><select id="transfer-target" name="userId">${candidates.map((member) => `<option value="${escapeHTML(member.userId)}">${escapeHTML(member.name)} · ${escapeHTML(roleLabel(member.role))}</option>`).join('')}</select></div></div><div class="modal-footer"><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Transfer ownership</button></div></form></section></div>`, 'transfer', { focus: '#transfer-target' });
+  }
+
+  function deleteWorkspaceModal() {
+    const workspace = state.session.workspace;
+    if (!workspace) return;
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-workspace-title"><div class="modal-header"><div><h2 id="delete-workspace-title">Delete ${escapeHTML(workspace.name)}</h2><p>Every project, generation, and file inside is removed for everyone. This cannot be undone.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="delete-workspace-form"><div class="modal-body"><div class="form-field"><label for="delete-workspace-confirm">Type <strong>${escapeHTML(workspace.name)}</strong> to confirm</label><input id="delete-workspace-confirm" name="confirm" autocomplete="off" required /></div></div><div class="modal-footer"><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="danger-button" type="submit">Delete workspace</button></div></form></section></div>`, 'delete-workspace', { focus: '#delete-workspace-confirm' });
+  }
+
+  async function revokeInvite(inviteId) {
+    try {
+      const payload = await api.request(`/api/invites/${encodeURIComponent(inviteId)}`, { method: 'DELETE' });
+      state.session.invites = payload.invites || [];
+      renderPage();
+      showToast('Invite revoked.');
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
+  }
+
+  /** A single place that explains why a write was refused. */
+  function blockedWrite() {
+    if (api.online && signedIn() && !canWrite()) {
+      showToast(`Your role in ${state.session.workspace?.name || 'this workspace'} is ${roleLabel(state.session.role).toLowerCase()} — read only.`, 'error');
+      return true;
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------
@@ -1381,6 +1854,10 @@
    * Single boot call. If the server is not there, the prototype keeps working
    * from local storage and the UI says so instead of appearing broken.
    */
+  /** Mirrors the server's role ladder so the UI never offers a doomed action. */
+  const ROLE_RANK = { viewer: 1, editor: 2, admin: 3, owner: 4 };
+  const canServeRole = (role, capability) => (ROLE_RANK[role] || 0) >= (ROLE_RANK[capability === 'manage' ? 'admin' : 'editor'] || 0);
+
   async function bootstrap({ announce = false } = {}) {
     try {
       const data = await api.request('/api/bootstrap');
@@ -1389,6 +1866,12 @@
       api.providers = data.providers || [];
       api.capabilities = data.capabilities || {};
       api.lastError = '';
+      state.session.user = data.user || state.session.user;
+      state.session.role = data.role || state.session.role;
+      state.session.workspace = data.workspace || state.session.workspace;
+      state.session.workspaces = data.workspaces || state.session.workspaces;
+      state.session.canWrite = canServeRole(data.role, 'write');
+      state.session.canManage = canServeRole(data.role, 'manage');
       applyServerState({
         projects: data.projects,
         activity: data.activity,
@@ -1396,7 +1879,11 @@
         usage: data.usage,
         files: data.files,
         scheduler: data.scheduler,
+        members: data.members,
+        invites: data.invites,
+        assignableRoles: data.assignableRoles,
       });
+      hideAuthGate();
       state.models = data.models;
       state.settings = { ...state.settings, ...data.settings };
       if (Array.isArray(data.prompts) && data.prompts.length) promptData = data.prompts;
@@ -1407,6 +1894,13 @@
       if (announce) showToast(data.mode === 'live' ? 'Connected — generating with real models.' : 'Connected — the Studio demo engine is ready.');
       return true;
     } catch (error) {
+      if (error.status === 401) {
+        // The session is gone; the gate is the honest screen to show.
+        api.online = true;
+        api.lastError = error.message;
+        showAuthGate({ message: 'Sign in to see this workspace.' });
+        return false;
+      }
       api.online = false;
       api.mode = 'offline';
       api.lastError = error.message;
@@ -1420,7 +1914,7 @@
     const id = button.dataset.id;
     switch (action) {
       case 'open-command': commandModal(); break;
-      case 'new-project': newProjectModal(); break;
+      case 'new-project': if (blockedWrite()) break; newProjectModal(); break;
       case 'choose-model': showModelPicker(button); break;
       case 'choose-mode': showModePicker(button); break;
       case 'select-model': {
@@ -1522,7 +2016,7 @@
       }
       case 'new-automation': openNewAutomationModal(); break;
       case 'toggle-automation': toggleAutomation(id); break;
-      case 'run-automation': runAutomation(id); break;
+      case 'run-automation': if (blockedWrite()) break; runAutomation(id); break;
       case 'automation-templates': showToast('Templates are on the roadmap; create a workflow by hand for now.'); break;
       case 'download-usage': exportUsageCsv(); break;
       case 'backend-status': backendStatusModal(); break;
@@ -1554,10 +2048,53 @@
         showToast(project ? `Opening a canvas for “${project.title}”.` : 'Canvas is ready.');
         break;
       }
-      case 'command-new-project': closeModal(false); newProjectModal(); break;
+      case 'command-new-project': closeModal(false); if (blockedWrite()) break; newProjectModal(); break;
       case 'command-navigate': closeModal(false); navigate(button.dataset.page || 'overview'); break;
       case 'profile-menu': profileMenu(button); break;
       case 'workspace-menu': workspaceMenu(button); break;
+      case 'auth-mode': state.auth.error = ''; state.auth.mode = button.dataset.mode || 'signin'; renderAuthGate(); break;
+      case 'auth-open': closePopover(); state.auth.mode = 'signin'; showAuthGate({ message: '' }); break;
+      case 'auth-skip-invite': {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('invite');
+        window.history.replaceState({}, '', url.pathname + url.search);
+        state.auth.invite = null;
+        state.auth.inviteToken = '';
+        if (signedIn()) { hideAuthGate(); } else { showAuthGate({ message: '' }); }
+        break;
+      }
+      case 'go-page': {
+        closePopover();
+        state.page = button.dataset.page || 'overview';
+        if (button.dataset.tab) state.settingsTab = button.dataset.tab;
+        window.location.hash = `#${state.page}`;
+        renderPage();
+        break;
+      }
+      case 'switch-workspace': switchWorkspace(button.dataset.id); break;
+      case 'new-workspace': newWorkspaceModal(); break;
+      case 'sign-out': signOut(); break;
+      case 'invite-modal': inviteModal(); break;
+      case 'copy-invite': {
+        const url = button.dataset.url || '';
+        if (!url) return;
+        navigator.clipboard?.writeText(url).then(
+          () => showToast('Invite link copied.'),
+          () => showToast('Copy it from the field instead.', 'error'),
+        );
+        break;
+      }
+      case 'revoke-invite': revokeInvite(button.dataset.id); break;
+      case 'remove-member': removeMember(button.dataset.id, button.dataset.name); break;
+      case 'delete-workspace': deleteWorkspaceModal(); break;
+      case 'transfer-ownership': transferOwnershipModal(); break;
+      case 'confirm-remove-member': {
+        const id = button.dataset.id;
+        api.request(`/api/members/${encodeURIComponent(id)}`, { method: 'DELETE' })
+          .then((payload) => { closeModal(); state.session.members = payload.members || []; renderPage(); showToast('They no longer have access to this workspace.'); })
+          .catch((error) => { closeModal(); showToast(error.message, 'error'); });
+        break;
+      }
       case 'profile-info': closePopover(); showToast('Studio OS starter · your creative workspace prototype.'); break;
       case 'workspace-info': closePopover(); showToast('Workspace switching can be added when you connect an account.'); break;
       case 'activity-refresh': {
@@ -1617,12 +2154,95 @@
   // both would upload the same file twice.
   document.addEventListener('change', (event) => {
     if (event.target.matches?.('[data-schedule-kind]')) syncScheduleFields(event.target.closest('form') || document);
+    if (event.target.matches?.('[data-action="change-role"]')) {
+      changeMemberRole(event.target.dataset.id, event.target.value);
+      return;
+    }
     if (event.target.id === 'attachment-input' && event.target.files?.length) {
       uploadAttachments(event.target.files);
     }
   });
 
   document.addEventListener('submit', (event) => {
+    if (event.target.id === 'auth-form') { event.preventDefault(); submitAuthGate(event.target); return; }
+    if (event.target.id === 'invite-form') { event.preventDefault(); submitInvite(event.target); return; }
+    if (event.target.id === 'password-form') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      api.request('/api/me', { method: 'PATCH', body: { currentPassword: String(data.get('currentPassword') || ''), password: String(data.get('password') || '') } })
+        .then(() => { event.target.reset(); showToast('Password updated. Other sessions were signed out.'); })
+        .catch((error) => showToast(error.message, 'error'));
+      return;
+    }
+    if (event.target.id === 'invite-form-modal') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      api.request('/api/invites', { method: 'POST', body: { email: String(data.get('email') || ''), role: String(data.get('role') || 'editor') } })
+        .then((payload) => {
+          state.session.invites = payload.invites || [];
+          inviteLinkModal({ email: payload.invite.email, role: payload.invite.role, acceptUrl: payload.acceptUrl, expiresInDays: payload.expiresInDays });
+          if (state.page === 'team') renderPage();
+        })
+        .catch((error) => { closeModal(); showToast(error.message, 'error'); });
+      return;
+    }
+    if (event.target.id === 'create-workspace-form') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      const name = String(data.get('name') || '').trim();
+      if (!name) return;
+      api.request('/api/workspaces', { method: 'POST', body: { name } })
+        .then((payload) => {
+          closeModal();
+          state.session.workspace = payload.workspace;
+          state.session.role = payload.workspace.role;
+          state.session.workspaces = payload.workspaces || [];
+          state.projects = [];
+          state.activity = [];
+          state.uploads = [];
+          return bootstrap({ announce: false }).then(() => { renderPage(); showToast(`“${payload.workspace.name}” is ready.`); });
+        })
+        .catch((error) => { closeModal(); showToast(error.message, 'error'); });
+      return;
+    }
+    if (event.target.id === 'delete-workspace-form') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      const active = state.session.workspace;
+      api.request(`/api/workspaces/${encodeURIComponent(active.id)}`, { method: 'DELETE', body: { confirm: String(data.get('confirm') || '') } })
+        .then(async (payload) => {
+          closeModal();
+          state.session.workspaces = payload.workspaces || [];
+          if (payload.signedOut) { await signOut(); return; }
+          state.session.workspace = payload.workspace;
+          state.session.role = payload.workspace.role;
+          state.projects = [];
+          state.activity = [];
+          state.uploads = [];
+          await bootstrap({ announce: false });
+          state.page = 'overview';
+          renderPage();
+          showToast('Workspace deleted.');
+        })
+        .catch((error) => showToast(error.message, 'error'));
+      return;
+    }
+    if (event.target.id === 'transfer-form') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      const active = state.session.workspace;
+      api.request(`/api/workspaces/${encodeURIComponent(active.id)}`, { method: 'PATCH', body: { transferTo: String(data.get('userId') || '') } })
+        .then(async (payload) => {
+          closeModal();
+          state.session.members = payload.members || [];
+          if (typeof payload.role === 'string') state.session.role = payload.role;
+          await bootstrap({ announce: false });
+          renderPage();
+          showToast('Ownership transferred. You are now an admin.');
+        })
+        .catch((error) => { closeModal(); showToast(error.message, 'error'); });
+      return;
+    }
     if (event.target.id === 'prompt-form') {
       event.preventDefault();
       const input = document.getElementById('main-prompt');
@@ -1724,8 +2344,34 @@
       for (const key of ['name', 'email', 'workspace', 'timezone']) if (data.has(key)) state.settings[key] = String(data.get(key));
       saveStorage(STORAGE.settings, state.settings);
       if (!api.online) { showToast('Your settings have been saved in this browser.'); return; }
-      api.request('/api/settings', { method: 'PUT', body: state.settings })
-        .then((payload) => { state.settings = { ...state.settings, ...payload.settings }; updateShell(); renderPage(); showToast('Settings saved to your workspace.'); })
+
+      // Profile edits belong to the account; everything else to the workspace.
+      if (state.settingsTab === 'Profile') {
+        api.request('/api/me', { method: 'PATCH', body: { name: state.settings.name } })
+          .then((payload) => {
+            state.session.user = payload.user;
+            state.session.members = payload.members || state.session.members;
+            updateShell();
+            renderPage();
+            showToast('Profile saved.');
+          })
+          .catch((error) => showToast(error.message, 'error'));
+        return;
+      }
+      const body = state.settingsTab === 'Workspace'
+        ? { workspace: state.settings.workspace }
+        : { timezone: state.settings.timezone };
+      api.request('/api/settings', { method: 'PUT', body })
+        .then((payload) => {
+          state.settings = { ...state.settings, ...payload.settings };
+          if (payload.workspace) {
+            state.session.workspace = payload.workspace;
+            state.session.workspaces = state.session.workspaces.map((workspace) => (workspace.id === payload.workspace.id ? { ...workspace, name: payload.workspace.name } : workspace));
+          }
+          updateShell();
+          renderPage();
+          showToast('Settings saved to your workspace.');
+        })
         .catch((error) => showToast(error.message, 'error'));
     }
   });
@@ -1775,15 +2421,74 @@
   renderPage();
 
   /**
-   * Boot: render the offline workspace immediately (never a blank screen), then
-   * upgrade to the server's data. A few quiet retries cover the case where the
-   * frontend is opened moments before the server finishes starting.
+   * Boot. The order matters:
+   *   1. ask the server who we are (a 401 here is normal, not an error)
+   *   2. an invite link in the URL turns the gate into an acceptance screen
+   *   3. signed in  -> load the workspace
+   *      signed out -> show the gate, and keep the shell hidden behind it
+   * A few quiet retries cover the case where the page is opened moments before
+   * the server finishes starting.
    */
   (async () => {
+    // Never a blank page: paint the demo workspace straight away, then upgrade
+    // to the server's data (or cover it with the gate) as soon as it answers.
+    updateShell();
+    renderPage();
+    const inviteToken = inviteTokenFromUrl();
     let attempts = 0;
-      while (!(await bootstrap()) && attempts < 3) {
-        attempts += 1;
-        await new Promise((resolve) => setTimeout(resolve, 4_000));
+    while (attempts < 4) {
+      attempts += 1;
+      let session = null;
+      try {
+        session = await api.request('/api/auth/session');
+        api.online = true;
+        api.capabilities = session.capabilities || api.capabilities;
+        state.auth.firstRun = Boolean(session.firstRun);
+        state.auth.claimable = session.claimable || [];
+        state.auth.signupsOpen = session.signupsOpen !== false;
+        if (session.firstRun && !inviteToken) state.auth.mode = 'signup';
+      } catch (error) {
+        // No server yet: the demo workspace is already on screen, so retrying
+        // quietly is enough. After the last attempt, stay offline.
+        if (attempts >= 4) {
+          api.online = false;
+          state.auth.error = '';
+          hideAuthGate();
+          updateEnvPill();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        continue;
       }
+
+      if (inviteToken) {
+        await loadInvite(inviteToken);
+        if (session.authenticated) {
+          // Signed in and invited: keep both, the gate offers a one-click join.
+          state.auth.invite = { ...state.auth.invite };
+        }
+        document.body.classList.add('is-locked');
+        renderAuthGate();
+        return;
+      }
+
+      if (!session.authenticated) {
+        showAuthGate({ message: '' });
+        return;
+      }
+
+      state.session.user = session.user;
+      state.session.role = session.role;
+      state.session.workspace = session.workspace;
+      state.session.workspaces = session.workspaces || [];
+      hideAuthGate();
+      updateShell();
+      const ok = await bootstrap({ announce: false });
+      if (!ok && attempts < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        continue;
+      }
+      return;
+    }
   })();
 })();

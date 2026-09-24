@@ -102,13 +102,58 @@ applies them directly rather than firing three more requests and risking a stale
 ## Data model
 
 ```
+users ──── memberships ──── workspaces ──── invites
+  │             │                 │
+  └── sessions  └── role          └── every content table below carries workspace_id
+                                      │
 projects ──┬── generations (project_id, ON DELETE SET NULL)
            ├── files (project_id)  ◄── bytes live in data/uploads/
            │
 automations ──┬── automation_runs ──► generations (generation_id)
               │
-prompts      settings (key/value)      activity (feed)
+prompts      settings (workspace_id, key)      activity (feed)
 ```
+
+### Tenancy
+
+`users`, `workspaces`, `memberships`, `sessions`, and `invites` are the account tables. Every
+content table gained a `workspace_id`, and **no route queries content directly**: `store.forWorkspace(id)`
+returns a scoped handle whose statements all carry the workspace id, so a forgotten `WHERE` clause
+cannot leak another tenant's row. Asking for a project that exists in a different workspace answers
+`404`, the same as asking for one that never existed.
+
+A workspace always has exactly one owner. Transferring ownership demotes the previous owner to
+admin in the same transaction, and the owner row cannot be edited or removed by anyone — including
+themselves — which is what makes "exactly one owner" true rather than aspirational.
+
+### Accounts and sessions
+
+| Concern | Decision |
+| --- | --- |
+| Passwords | `scrypt` (N=16384, r=8, p=1) with a 16-byte random salt, stored as `scrypt$salt$hash`; verified in constant time |
+| Sessions | 32 random bytes, base64url in the cookie; only its SHA-256 digest is stored, so a database copy cannot be replayed |
+| Cookie | `studio_session`, `HttpOnly`, `SameSite=Lax`, `Secure` when `x-forwarded-proto: https`; 30-day sliding expiry |
+| Scripts | The same token is accepted as `Authorization: Bearer …` |
+| CSRF | Any cookie-authenticated write must be same-origin (missing `Origin`/`Referer` is treated as a non-browser client, which cannot send an ambient cookie) |
+| Throttling | Sign-in and sign-up are limited per `email|ip` in memory (10 per 15 minutes by default) |
+| Enumeration | A wrong password and an unknown email return the identical 401 body |
+| Password change | Every session for that user is deleted, then the caller signs in again |
+
+Roles are a ladder — `viewer(1) < editor(2) < admin(3) < owner(4)` — and routes ask for a
+**capability** (`read`, `write`, `run`, `manage`, `own`) rather than naming a role, so adding a role
+later is a one-line change in `server/auth.js`. The frontend mirrors the ladder only to hide
+controls; the server never trusts it.
+
+### The upgrade path
+
+A database created before this phase has no workspace column anywhere. `server/db.js` migrates it
+additively: tables are created if missing, missing columns are added, the old global `settings`
+table is rebuilt with a composite key, and existing rows are parked in a workspace with **no
+members**. The next person to sign up claims it (`claimed: true` in the response), so an existing
+studio stays reachable without a default password. Indexes are created after the migration, never
+inside the schema string, because an index on a column that only exists post-migration cannot be
+created before it. `npm test` builds a database with the previous release's schema and asserts the
+migration keeps its projects, generations, settings, and activity.
 
 - **projects** — title, type, model, status, brief, deterministic artwork key, output count, archived flag.
 - **generations** — the unit of truth for usage: provider, model id and label, kind, mode, prompt,
@@ -118,7 +163,8 @@ prompts      settings (key/value)      activity (feed)
   the scheduler claims, and a run history linked to the generation each run produced.
 - **files** — uploads and generated assets: name, mime, size, kind (`attachment` / `output`), the
   stored filename, a text excerpt for prompt use, and the project/generation they belong to.
-- **settings** — workspace, profile, timezone; a key/value table so new preferences need no migration.
+- **settings** — per-workspace preferences and timezone; a `(workspace_id, key)` table so new
+  preferences need no migration.
 - **activity** — the dashboard feed, written whenever something meaningful happens.
 
 Archiving a project sets a flag rather than deleting rows, so usage history stays intact.
@@ -174,6 +220,17 @@ keep it honest:
 - **The server is the source of truth when it is present.** `GET /api/bootstrap` returns the whole
   workspace in one call and overwrites local state; anything the server reports as changed is
   applied through a single `applyServerState()` helper.
+
+The gate comes first. Boot asks `GET /api/auth/session`; if nobody is signed in, an auth screen
+covers the shell (the shell is never rendered behind it) and the studio loads only after a session
+exists. A `?invite=<token>` link in the URL turns that same screen into an acceptance flow. Every
+request that comes back `401` re-opens the gate, so an expired session can never leave a half-dead
+workspace on screen.
+
+Role awareness lives in one place, `state.session.canWrite` / `canManage`, read from the bootstrap
+payload. It hides what the caller cannot use — the composer becomes a read-only note for viewers,
+invite controls disappear below admin, the owner's row is a badge instead of a dropdown — but it is
+only a courtesy: the same action attempted directly against the API is refused by the server.
 
 Offline behaviour is deliberate: if the API is not reachable, the app renders the demo workspace
 from local storage, the status pill switches to `Demo mode`, and generation is replaced by a clear

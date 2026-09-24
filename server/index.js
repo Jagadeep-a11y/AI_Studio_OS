@@ -8,6 +8,9 @@ import { createGateway } from './gateway.js';
 import { createStore } from './store.js';
 import { createAutomationRunner } from './automations.js';
 import { createScheduler } from './scheduler.js';
+import { createAccounts } from './accounts.js';
+import { escapeText } from './html.js';
+import { clearCookie, parseCookies, roleRank, sameOrigin, serializeCookie } from './auth.js';
 import { buildAttachments, createFileStore, MAX_FILES_PER_REQUEST, parseMultipart } from './files.js';
 import { humanizeUntil, nextOccurrence, normalizeSchedule } from './schedule.js';
 import { ProviderError } from './providers/util.js';
@@ -22,10 +25,12 @@ import { ProviderError } from './providers/util.js';
 
 const db = openDatabase(config.dbPath);
 const store = createStore(db);
+const accounts = createAccounts({ store, config });
+const parseCookiesHeader = (header) => parseCookies(header);
 const gateway = createGateway(config);
 const files = createFileStore({ db, store, uploadDir: config.uploadsDir });
 const automations = createAutomationRunner({ store, gateway });
-const scheduler = createScheduler({ store, runner: automations, config });
+const scheduler = createScheduler({ store, accounts, runner: automations, config });
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -67,6 +72,22 @@ const fail = (res, error, fallbackStatus = 500) => {
   });
 };
 
+/**
+ * The per-request context.
+ *
+ * `auth` is resolved once, here, and every workspace route reads its data
+ * through `ctx.data` — a store pinned to the caller's workspace. Routes cannot
+ * accidentally query across workspaces because they never see the global store.
+ */
+function buildContext(req, res, url, pathname) {
+  const auth = pathname.startsWith('/api/') ? accounts.resolve(req) : null;
+  return { req, res, url, pathname, auth, data: auth?.data || null, user: auth?.user || null, workspace: auth?.workspace || null, role: auth?.role || null };
+}
+
+/** Require a capability before a handler runs. Returns the auth context. */
+const guard = (ctx, capability) => accounts.require(ctx.auth, capability);
+
+/** HTML-escapes a value for the activity feed, which stores markup. */
 async function readJsonBody(req, limitBytes = 1_000_000) {
   let size = 0;
   const chunks = [];
@@ -99,130 +120,351 @@ function titleFromPrompt(prompt) {
 // ---------------------------------------------------------------------------
 
 const routes = {
+  // --- Public -------------------------------------------------------------
   'GET /api/health': async ({ res, url }) => {
     const probe = url.searchParams.get('probe') === '1';
     const providers = providerSummary();
-    if (!probe) return json(res, 200, { ok: true, mode: gateway.isDemoOnly() ? 'demo' : 'live', uptimeMs: Date.now() - startedAt, providers, scheduler: scheduler.status() });
+    const base = {
+      ok: true,
+      mode: gateway.isDemoOnly() ? 'demo' : 'live',
+      uptimeMs: Date.now() - startedAt,
+      providers,
+      auth: { required: true, firstRun: accounts.isFirstRun() },
+    };
+    if (!probe) return json(res, 200, { ...base, scheduler: scheduler.status() });
     const checks = await Promise.all(gateway.providers.filter((provider) => provider.isConfigured()).map(async (provider) => ({
       id: provider.id,
       ...(await provider.checkHealth({})),
     })));
-    return json(res, 200, { ok: true, mode: gateway.isDemoOnly() ? 'demo' : 'live', providers, checks });
+    return json(res, 200, { ...base, checks });
   },
 
-  /** One call that boots the whole UI: workspace, models, projects, the lot. */
-  'GET /api/bootstrap': async ({ res }) => {
+  /**
+   * Who am I? Answered for both signed-in and signed-out callers, because the
+   * sign-in screen needs to know whether this is a brand-new studio (offer to
+   * claim the seeded workspace) or an existing one (plain sign-in form).
+   */
+  'GET /api/auth/session': async (ctx) => {
+    const { res } = ctx;
+    if (!ctx.auth) {
+      return json(res, 200, {
+        authenticated: false,
+        firstRun: accounts.isFirstRun(),
+        claimable: accounts.claimableWorkspaces().map((workspace) => ({ id: workspace.id, name: workspace.name })),
+        signupsOpen: config.auth.allowSignups,
+        providers: providerSummary(),
+      });
+    }
+    json(res, 200, { authenticated: true, ...sessionPayload(ctx, gateway) });
+  },
+
+  'POST /api/auth/signup': async (ctx) => {
+    const { res, req } = ctx;
+    const body = await readJsonBody(req);
+    const result = await accounts.signUp({
+      email: body.email,
+      name: text(body.name, 80),
+      password: body.password,
+      workspaceName: text(body.workspace, 80),
+    }, req);
+    const token = accounts.startSession(result.user, result.workspace, req);
+    setSessionCookie(req, res, token, accounts.sessionTtlMs);
+    json(res, 201, {
+      user: result.user,
+      workspace: result.workspace,
+      claimed: result.claimed,
+      workspaces: store.listWorkspacesForUser(result.user.id).map(({ id, name, role }) => ({ id, name, role })),
+      capabilities: capabilities(),
+      providers: providerSummary(),
+    });
+  },
+
+  'POST /api/auth/login': async (ctx) => {
+    const { res, req } = ctx;
+    const body = await readJsonBody(req);
+    const { user, workspace } = await accounts.signIn({ email: body.email, password: body.password }, req);
+    const token = accounts.startSession(user, workspace, req);
+    setSessionCookie(req, res, token, accounts.sessionTtlMs);
+    json(res, 200, {
+      user,
+      workspace,
+      workspaces: store.listWorkspacesForUser(user.id).map(({ id, name, role }) => ({ id, name, role })),
+      capabilities: capabilities(),
+      providers: providerSummary(),
+    });
+  },
+
+  'POST /api/auth/logout': async (ctx) => {
+    const { res, req } = ctx;
+    accounts.signOut(ctx.auth?.token || '');
+    clearSessionCookie(req, res);
+    json(res, 200, { signedOut: true });
+  },
+
+  /** Public: the accept screen needs to describe the invite before sign-in. */
+  'GET /api/invites/:token': null, // handled by the item routes (public branch)
+
+  // --- Everything below requires a signed-in member -----------------------
+  /** One call that boots the whole UI: workspace, members, models, the lot. */
+  'GET /api/bootstrap': async (ctx) => {
+    guard(ctx, 'read');
+    const { res, data } = ctx;
     await gateway.refreshDiscovery();
     const { models, providers, curated } = gateway.listModels();
+    const settings = data.getSettings();
     json(res, 200, {
-      workspace: store.getSettings().workspace || config.workspace,
+      workspace: { ...ctx.workspace, settings: settings.workspace || ctx.workspace.name },
+      user: ctx.user,
+      role: ctx.role,
+      workspaces: ctx.auth.workspaces,
+      members: data.listMembers(),
+      invites: roleRank(ctx.role) >= roleRank('admin') ? data.invites() : [],
+      assignableRoles: assignableRoles(ctx.role),
       mode: gateway.isDemoOnly() ? 'demo' : 'live',
       allowMock: config.allowMock,
       providers,
       models,
       curatedModels: curated,
-      projects: store.listProjects(),
-      prompts: store.listPrompts(),
-      automations: store.listAutomations(),
-      activity: store.listActivity(6),
-      settings: store.getSettings(),
-      usage: store.usageSummary(),
-      scheduler: scheduler.status(),
+      projects: data.listProjects(),
+      prompts: data.listPrompts(),
+      automations: data.listAutomations().map(withRunLabel),
+      activity: data.listActivity(6),
+      settings,
+      usage: data.usageSummary(),
+      scheduler: scheduler.status(ctx.workspace.id),
+      consent: config.consent,
       capabilities: capabilities(),
     });
   },
 
-  'GET /api/models': async ({ res, url }) => {
+  'GET /api/models': async (ctx) => {
+    guard(ctx, 'read');
+    const { res, url } = ctx;
     if (url.searchParams.get('refresh') === '1') await gateway.refreshDiscovery({ force: true });
     else await gateway.refreshDiscovery();
     json(res, 200, gateway.listModels());
   },
 
-  'GET /api/projects': async ({ res, url }) => {
-    json(res, 200, { projects: store.listProjects({ includeArchived: url.searchParams.get('archived') === '1' }) });
+  // --- Workspace and members ----------------------------------------------
+  'GET /api/workspaces': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, { workspaces: ctx.auth.workspaces, active: ctx.workspace.id });
   },
 
-  'POST /api/projects': async ({ res, req }) => {
+  'POST /api/workspaces': async (ctx) => {
+    guard(ctx, 'manage');
+    const body = await readJsonBody(ctx.req);
+    const workspace = accounts.createWorkspaceFor(ctx.user, text(body.name, 80));
+    const token = accounts.startSession(ctx.user, workspace, ctx.req);
+    setSessionCookie(ctx.req, ctx.res, token, accounts.sessionTtlMs);
+    json(ctx.res, 201, {
+      workspace,
+      workspaces: store.listWorkspacesForUser(ctx.user.id).map(({ id, name, role }) => ({ id, name, role })),
+    });
+  },
+
+  'POST /api/workspaces/switch': async (ctx) => {
+    guard(ctx, 'read');
+    const body = await readJsonBody(ctx.req);
+    const { workspace } = accounts.switchWorkspace(ctx.auth, text(body.workspaceId, 60));
+    json(ctx.res, 200, {
+      workspace,
+      workspaces: store.listWorkspacesForUser(ctx.user.id).map(({ id, name, role }) => ({ id, name, role })),
+    });
+  },
+
+  'GET /api/members': async (ctx) => {
+    guard(ctx, 'read');
+    const canManage = roleRank(ctx.role) >= roleRank('admin');
+    json(ctx.res, 200, {
+      members: ctx.data.listMembers(),
+      // Pending invites carry email addresses, so only managers see them.
+      invites: canManage ? ctx.data.invites() : [],
+      assignableRoles: assignableRoles(ctx.role),
+      canManage,
+      role: ctx.role,
+    });
+  },
+
+  'POST /api/invites': async (ctx) => {
+    guard(ctx, 'manage');
+    const body = await readJsonBody(ctx.req);
+    const origin = `${ctx.req.headers['x-forwarded-proto'] || 'http'}://${ctx.req.headers.host || `localhost:${config.port}`}`;
+    const result = accounts.invite(ctx.auth, { email: body.email, role: text(body.role, 20) || 'editor' }, origin);
+    json(ctx.res, 201, {
+      invite: result.invite,
+      // The link is returned once, for the inviter to pass on. Nothing is
+      // emailed in this build, so the UI has to show it plainly.
+      acceptUrl: result.acceptUrl,
+      expiresInDays: result.expiresInDays,
+      invites: ctx.data.invites(),
+    });
+  },
+
+  'GET /api/projects': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, { projects: ctx.data.listProjects({ includeArchived: ctx.url.searchParams.get('archived') === '1' }) });
+  },
+
+  'POST /api/projects': async (ctx) => {
+    guard(ctx, 'write');
+    const { res, req, data } = ctx;
     const body = await readJsonBody(req);
-    const project = store.createProject({
+    const project = data.createProject({
       title: body.title,
       type: body.type,
       model: body.model,
       prompt: body.prompt,
       status: body.status,
     });
-    store.addActivity({ icon: 'folder', tone: 'orange', line: `<strong>${escapeForActivity(project.model)}</strong> started a new project`, project: project.title });
-    json(res, 201, { project, activity: store.listActivity(6) });
+    data.addActivity({ icon: 'folder', tone: 'orange', line: `<strong>${escapeText(project.model)}</strong> started a new project`, project: project.title });
+    json(res, 201, { project, activity: data.listActivity(6) });
   },
 
-  'GET /api/prompts': async ({ res }) => json(res, 200, { prompts: store.listPrompts() }),
+  'GET /api/prompts': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, { prompts: ctx.data.listPrompts() });
+  },
 
-  'POST /api/prompts': async ({ res, req }) => {
+  'POST /api/prompts': async (ctx) => {
+    guard(ctx, 'write');
+    const { res, req, data } = ctx;
     const body = await readJsonBody(req);
     if (!text(body.body || body.text)) throw new ProviderError('A prompt needs some text', { status: 400, code: 'invalid_prompt' });
-    const prompt = store.createPrompt({ title: body.title, category: body.category, mode: body.mode, body: body.body || body.text, icon: body.icon });
-    json(res, 201, { prompt, prompts: store.listPrompts() });
+    const prompt = data.createPrompt({ title: body.title, category: body.category, mode: body.mode, body: body.body || body.text, icon: body.icon });
+    json(res, 201, { prompt, prompts: data.listPrompts() });
   },
 
-  'GET /api/automations': async ({ res, url }) => {
+  'GET /api/automations': async (ctx) => {
+    guard(ctx, 'read');
+    const { res, url, data } = ctx;
     const withRuns = url.searchParams.get('runs') === '1';
-    const automations = store.listAutomations().map((automation) => ({
+    const automations = data.listAutomations().map((automation) => ({
       ...automation,
       nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
-      runs: withRuns ? store.listAutomationRuns(automation.id, 5).map(stripRunGeneration) : undefined,
+      runs: withRuns ? data.listAutomationRuns(automation.id, 5).map(stripRunGeneration) : undefined,
     }));
-    json(res, 200, { automations, scheduler: scheduler.status(), stats: store.automationRunStats(monthStartIso()) });
+    json(res, 200, { automations, scheduler: scheduler.status(ctx.workspace.id), stats: data.automationRunStats(monthStartIso()) });
   },
 
-  'POST /api/automations': async ({ res, req }) => {
+  'POST /api/automations': async (ctx) => {
+    guard(ctx, 'write');
+    const { res, req, data } = ctx;
     const body = await readJsonBody(req);
     const { schedule, error } = normalizeSchedule(body.schedule);
     if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
-    const automation = store.createAutomation({
+    const automation = data.createAutomation({
       name: body.name,
       description: text(body.description, 400),
       action: text(body.action, 80) || 'Curate & summarize',
       schedule,
-      timeZone: store.getSettings().timezone || 'UTC',
+      timeZone: data.getSettings().timezone || 'UTC',
     });
-    json(res, 201, { automation: withRunLabel(automation), automations: store.listAutomations().map(withRunLabel) });
+    json(res, 201, { automation: withRunLabel(automation), automations: data.listAutomations().map(withRunLabel) });
   },
 
   /** Scheduler health, for the Connections tab. */
-  'GET /api/scheduler': async ({ res }) => json(res, 200, scheduler.status()),
+  'GET /api/scheduler': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, scheduler.status(ctx.workspace.id));
+  },
 
-  'GET /api/files': async ({ res, url }) => {
+  'GET /api/files': async (ctx) => {
+    guard(ctx, 'read');
+    const { res, url, data } = ctx;
     const projectId = url.searchParams.get('projectId');
     json(res, 200, {
-      files: projectId ? store.filesForProject(projectId, Number(url.searchParams.get('limit')) || 50) : store.listFiles({ limit: Number(url.searchParams.get('limit')) || 50 }),
-      storage: files.stats(),
+      files: projectId ? data.filesForProject(projectId, Number(url.searchParams.get('limit')) || 50) : data.listFiles({ limit: Number(url.searchParams.get('limit')) || 50 }),
+      storage: data.fileStats(),
     });
   },
 
   /** Multipart upload of reference material. */
-  'POST /api/files': async ({ res, req, url }) => handleUpload(req, res, url),
-
-  'GET /api/usage': async ({ res }) => json(res, 200, store.usageSummary()),
-
-  'GET /api/activity': async ({ res, url }) => {
-    json(res, 200, { activity: store.listActivity(Number(url.searchParams.get('limit')) || 8) });
+  'POST /api/files': async (ctx) => {
+    guard(ctx, 'write');
+    return handleUpload(ctx);
   },
 
-  'GET /api/settings': async ({ res }) => json(res, 200, { settings: store.getSettings(), providers: providerSummary() }),
+  'GET /api/usage': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, ctx.data.usageSummary());
+  },
 
-  'PUT /api/settings': async ({ res, req }) => {
-    const body = await readJsonBody(req);
-    const allowed = ['name', 'email', 'workspace', 'timezone', 'startPage', 'defaultModel'];
+  'GET /api/activity': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, { activity: ctx.data.listActivity(Number(ctx.url.searchParams.get('limit')) || 8) });
+  },
+
+  'GET /api/settings': async (ctx) => {
+    guard(ctx, 'read');
+    json(ctx.res, 200, { settings: ctx.data.getSettings(), providers: providerSummary(), role: ctx.role, workspace: ctx.workspace, user: ctx.user });
+  },
+
+  'PUT /api/settings': async (ctx) => {
+    guard(ctx, 'write');
+    const body = await readJsonBody(ctx.req);
+    // Only known preference keys are stored: an unknown key would quietly become
+    // workspace data that nothing reads.
     const patch = {};
-    for (const key of allowed) if (key in body) patch[key] = text(body[key], 200);
-    json(res, 200, { settings: store.saveSettings(patch) });
+    for (const key of ['name', 'email', 'timezone', 'startPage', 'defaultModel']) {
+      if (body[key] !== undefined) patch[key] = text(body[key], 120);
+    }
+    if (body.workspace !== undefined) patch.workspace = text(body.workspace, 80);
+    const settings = ctx.data.saveSettings(patch);
+    // The workspace name lives on the workspace itself; the preference mirrors it.
+    if (patch.workspace && patch.workspace !== ctx.workspace.name) {
+      accounts.renameWorkspace(ctx.auth, patch.workspace);
+      settings.workspace = patch.workspace;
+    }
+    json(ctx.res, 200, { settings, workspace: store.getWorkspace(ctx.workspace.id) });
   },
 };
 
+/**
+ * The signed-in payload. Shared by `/api/auth/session`, sign-up, and sign-in so
+ * a client can treat them identically.
+ */
+function sessionPayload(ctx, gatewayInstance = gateway) {
+  return {
+    user: ctx.user,
+    workspace: ctx.workspace,
+    workspaces: ctx.auth.workspaces,
+    role: ctx.role,
+    capabilities: capabilities(),
+    mode: gatewayInstance.isDemoOnly() ? 'demo' : 'live',
+    providers: providerSummary(),
+  };
+}
+
+const cookieOptions = (req) => ({ secure: String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https' || req.socket?.encrypted === true });
+
+function setSessionCookie(req, res, token, ttlMs) {
+  res.setHeader('Set-Cookie', serializeCookie(accounts.cookieName, token, { maxAge: ttlMs / 1000, ...cookieOptions(req) }));
+}
+
+function clearSessionCookie(req, res) {
+  res.setHeader('Set-Cookie', clearCookie(accounts.cookieName, cookieOptions(req)));
+}
+
+/** Can a role do a capability? Kept next to the routes that need the answer. */
+const canManageRole = (role, capability) => roleRank(role) >= roleRank(capability === 'own' ? 'owner' : 'admin');
+
+const roleHint = (role, capability) => (capability === 'own'
+  ? 'Only the workspace owner can do that. Ask them to transfer ownership.'
+  : `Only an owner or an admin of that workspace can do that — yours is ${role}.`);
+
+/** Adds the human label the UI shows next to a scheduled workflow. */
 const withRunLabel = (automation) => ({
   ...automation,
   nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
 });
+
+/** Roles an actor may hand out — the UI uses it to disable impossible choices. */
+function assignableRoles(role) {
+  if (role === 'owner') return ['admin', 'editor', 'viewer'];
+  if (role === 'admin') return ['editor', 'viewer'];
+  return [];
+}
 
 /** Run rows carry their generation inline for the UI, but not in list payloads. */
 const stripRunGeneration = (run) => ({ ...run, generation: run.generation ? { id: run.generation.id, model: run.generation.model, status: run.generation.status, credits: run.generation.credits } : null });
@@ -231,7 +473,8 @@ const stripRunGeneration = (run) => ({ ...run, generation: run.generation ? { id
  * Uploads reference material for a generation. Accepts multipart/form-data
  * (browser drag-and-drop or file picker) and returns the stored file records.
  */
-async function handleUpload(req, res, url) {
+async function handleUpload(ctx) {
+  const { req, res, url, data } = ctx;
   const contentType = req.headers['content-type'] || '';
   if (!contentType.startsWith('multipart/form-data')) {
     throw new ProviderError('Uploads must be sent as multipart/form-data', { status: 415, code: 'expected_multipart' });
@@ -252,8 +495,9 @@ async function handleUpload(req, res, url) {
   }
 
   const projectId = url.searchParams.get('projectId') || parts.find((part) => part.name === 'projectId')?.data?.toString('utf8') || null;
-  const project = projectId ? store.getProject(projectId) : null;
-  const stored = parts.map((part) => files.write({
+  const project = projectId ? data.getProject(projectId) : null;
+  const scoped = files.forWorkspace(data);
+  const stored = parts.map((part) => scoped.write({
     name: part.filename || part.name,
     mime: part.type,
     buffer: part.data,
@@ -261,13 +505,15 @@ async function handleUpload(req, res, url) {
     projectId: project?.id || null,
   }));
 
-  if (project) store.touchProject(project.id);
-  json(res, 201, { files: stored, project: project ? store.getProject(project.id) : null, storage: files.stats() });
+  if (project) data.touchProject(project.id);
+  json(res, 201, { files: stored, project: project ? data.getProject(project.id) : null, storage: data.fileStats() });
 }
 
 /** Streams a stored upload with the headers a browser needs to show it inline. */
-async function serveStoredFile(res, req, id, download = false) {
-  const row = store.getFile(id);
+async function serveStoredFile(ctx, id, download = false) {
+  const { res, req, data } = ctx;
+  // Scoped lookup: a file id from another workspace simply does not resolve.
+  const row = data.getFileRow(id);
   if (!row) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
   const body = await files.read(row);
   res.writeHead(200, {
@@ -285,10 +531,10 @@ async function serveStoredFile(res, req, id, download = false) {
  * Event triggers run in the background: a status change should never make the
  * user wait for a model to finish. Failures land in the run history.
  */
-function fireEventAutomations(event, value, project) {
-  const matches = store.automationsForEvent(event, value);
+function fireEventAutomations(data, event, value, project) {
+  const matches = data.automationsForEvent(event, value);
   for (const automation of matches) {
-    automations.execute({ automation, source: 'event', project })
+    automations.execute({ automation, source: 'event', project, data })
       .then((result) => {
         if (result.status === 'succeeded') console.log(`⟳ “${automation.name}” ran on ${event}=${value}`);
       })
@@ -311,21 +557,22 @@ function capabilities() {
     billing: false,
     scheduling: Boolean(config.scheduler.enabled),
     eventTriggers: true,
+    accounts: true,
+    teams: true,
+    invites: true,
+    roles: ['owner', 'admin', 'editor', 'viewer'],
+    sessions: 'cookie',
+    storage: 'sqlite',
   };
 }
-
-/** Activity lines render as HTML, so user and model text is neutralised first. */
-const escapeForActivity = (value) => String(value ?? '')
-  .replace(/<[^>]*>/g, '')
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;');
 
 // ---------------------------------------------------------------------------
 // SSE generation
 // ---------------------------------------------------------------------------
 
-async function handleGenerate(req, res) {
+async function handleGenerate(ctx) {
+  const { req, res, data, user, workspace, role } = ctx;
+  guard(ctx, 'run');
   const body = await readJsonBody(req);
   const prompt = text(body.prompt, 8_000);
   if (!prompt) throw new ProviderError('Describe what you want to create first.', { status: 400, code: 'missing_prompt' });
@@ -334,9 +581,9 @@ async function handleGenerate(req, res) {
   const kind = gateway.kindForMode(mode);
 
   // A generation always belongs to a project, so output never floats loose.
-  let project = body.projectId ? store.getProject(body.projectId) : null;
+  let project = body.projectId ? data.getProject(body.projectId) : null;
   if (!project && body.createProject !== false) {
-    project = store.createProject({
+    project = data.createProject({
       title: body.title || titleFromPrompt(prompt),
       type: body.type || (kind === 'image' ? 'Image' : 'Writing'),
       model: text(body.model, 80) || 'Auto select',
@@ -347,8 +594,9 @@ async function handleGenerate(req, res) {
   if (!project && body.projectId) throw new ProviderError('That project no longer exists', { status: 404, code: 'project_not_found' });
 
   // Reference files the user attached to this prompt.
-  const attachmentRows = Array.isArray(body.fileIds) ? store.filesByIds(body.fileIds) : [];
-  const attachments = attachmentRows.length ? await buildAttachments(files, attachmentRows) : [];
+  const attachmentRows = Array.isArray(body.fileIds) ? data.filesByIds(body.fileIds) : [];
+  const scopedFiles = files.forWorkspace(data);
+  const attachments = attachmentRows.length ? await buildAttachments(scopedFiles, attachmentRows) : [];
 
   const generationId = `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const abort = new AbortController();
@@ -389,7 +637,7 @@ async function handleGenerate(req, res) {
     })) {
       if (event.type === 'start') {
         send('references', { references: event.references || [], imagesSent: event.imagesSent || 0 });
-        store.createGeneration({
+        data.createGeneration({
           id: generationId,
           projectId: project?.id || null,
           provider: event.provider,
@@ -425,7 +673,7 @@ async function handleGenerate(req, res) {
     let assetUrl = summary?.assetUrl || '';
     let assetFile = null;
     if (assetUrl.startsWith('data:')) {
-      assetFile = files.writeDataUrl({
+      assetFile = scopedFiles.writeDataUrl({
         dataUrl: assetUrl,
         name: `${project?.title || 'generation'}`.replace(/[^\w.-]+/g, '-').slice(0, 60) || 'output',
         projectId: project?.id || null,
@@ -434,7 +682,7 @@ async function handleGenerate(req, res) {
       if (assetFile) assetUrl = assetFile.url;
     }
 
-    const finished = store.finishGeneration(generationId, {
+    const finished = data.finishGeneration(generationId, {
       output: accumulated,
       assetUrl,
       status: failed ? 'failed' : 'succeeded',
@@ -448,27 +696,33 @@ async function handleGenerate(req, res) {
 
     let activity = null;
     if (project) {
-      store.recordOutput(project.id, { count: 1, status: failed ? project.status : 'In progress' });
-      activity = store.addActivity({
+      data.recordOutput(project.id, { count: 1, status: failed ? project.status : 'In progress' });
+      activity = data.addActivity({
         icon: failed ? 'close' : 'sparkles',
         tone: failed ? 'orange' : '',
-        line: `<strong>${escapeForActivity(finished?.model || 'A model')}</strong> ${failed ? 'hit an error while generating' : `finished a ${kind === 'image' ? 'render' : 'generation'}`}`,
+        line: `<strong>${escapeText(finished?.model || 'A model')}</strong> ${failed ? 'hit an error while generating' : `finished a ${kind === 'image' ? 'render' : 'generation'}`}`,
         project: project.title,
       });
     }
 
     send('done', {
       generation: finished ? { ...finished, assetFile } : finished,
-      project: project ? { ...store.getProject(project.id), files: store.filesForProject(project.id, 50) } : null,
-      activity: activity || store.listActivity(6),
-      usage: store.usageSummary(),
+      project: project ? { ...data.getProject(project.id), files: data.filesForProject(project.id, 50) } : null,
+      activity: activity || data.listActivity(6),
+      usage: data.usageSummary(),
       failed,
     });
   } catch (error) {
     // Covers failures before the stream started (bad model, no provider).
     const status = error instanceof ProviderError ? error.status : 500;
-    send('error', { message: error?.message || 'Generation failed', code: error?.code || 'server_error', hint: error?.hint || '', status });
-    send('done', { generation: store.getGeneration(generationId), project, failed: true, error: error?.message });
+    console.error(`Generation ${generationId} failed: ${error?.message}`);
+    try {
+      send('error', { message: error?.message || 'Generation failed', code: error?.code || 'server_error', hint: error?.hint || '', status });
+      send('done', { generation: data.getGeneration(generationId), project, failed: true, error: error?.message });
+    } catch (nested) {
+      // Reporting a failure must not become a bigger failure.
+      send('error', { message: nested?.message || 'Generation failed', code: 'stream_error' });
+    }
   } finally {
     if (!res.writableEnded) res.end();
   }
@@ -478,20 +732,144 @@ async function handleGenerate(req, res) {
 // Item routes with path parameters
 // ---------------------------------------------------------------------------
 
-async function handleItemRoute(req, res, pathname, url = new URL('http://localhost/')) {
+async function handleItemRoute(ctx) {
+  const { req, res, url, pathname } = ctx;
   const parts = pathname.split('/').filter(Boolean); // ['api', ...]
   const [, group, id, sub] = parts;
 
+  // --- Public: invite lookup, so the accept screen works before sign-in -----
+  if (group === 'invites' && id && req.method === 'GET') {
+    const described = accounts.describeInvite(id);
+    return json(res, 200, described);
+  }
+  if (group === 'invites' && id && sub === 'accept' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const result = await accounts.acceptInvite(id, { name: text(body.name, 80), password: body.password }, req);
+    const token = accounts.startSession(result.user, result.workspace, req);
+    setSessionCookie(req, res, token, accounts.sessionTtlMs);
+    return json(res, 200, {
+      user: result.user,
+      workspace: result.workspace,
+      workspaces: store.listWorkspacesForUser(result.user.id).map(({ id: workspaceId, name, role }) => ({ id: workspaceId, name, role })),
+      providers: providerSummary(),
+      capabilities: capabilities(),
+    });
+  }
+
+  // Everything else needs a signed-in member of a workspace.
+  guard(ctx, 'read');
+  const { data, user } = ctx;
+
+  /**
+   * Workspace administration addresses a workspace by id, which may not be the
+   * active one. Every check below therefore uses the *target's* membership and
+   * role — never the caller's role in whatever workspace their session points at.
+   */
+  if (group === 'workspaces' && id && (req.method === 'PATCH' || req.method === 'DELETE')) {
+    const target = (ctx.auth.workspaces || []).find((workspace) => workspace.id === id);
+    if (!target) return json(res, 404, { error: { message: 'That workspace is not one of yours.', code: 'workspace_not_found' } });
+    if (!canManageRole(target.role, req.method === 'DELETE' ? 'own' : 'manage')) {
+      return json(res, 403, {
+        error: {
+          message: `Your role in ${target.name} is ${target.role}, which cannot change it.`,
+          code: 'forbidden',
+          hint: roleHint(target.role, req.method === 'DELETE' ? 'own' : 'manage'),
+        },
+      });
+    }
+
+    if (req.method === 'PATCH') {
+      const body = await readJsonBody(req);
+      if (body.name !== undefined) return json(res, 200, { workspace: { ...store.renameWorkspace(id, text(body.name, 80)), role: target.role } });
+      if (body.plan) return json(res, 200, { workspace: { ...store.setWorkspacePlan(id, text(body.plan, 40)), role: target.role } });
+      if (body.transferTo) {
+        if (!store.membershipOf(id, body.transferTo)) {
+          return json(res, 404, { error: { message: 'That person is not in this workspace.', code: 'not_a_member' } });
+        }
+        const members = accounts.transferOwnership({ ...ctx.auth, workspace: store.getWorkspace(id), role: target.role }, body.transferTo);
+        return json(res, 200, {
+          members,
+          // If it was the active workspace, the caller's role just changed.
+          role: id === ctx.workspace.id ? 'admin' : ctx.role,
+        });
+      }
+      return json(res, 400, { error: { message: 'Nothing to change.', code: 'empty_patch' } });
+    }
+
+    // DELETE: irreversible, so the target's own name has to come back.
+    const body = await readJsonBody(req).catch(() => ({}));
+    if (body.confirm !== target.name) {
+      return json(res, 400, {
+        error: {
+          message: 'Deleting a workspace needs its name as confirmation.',
+          code: 'confirmation_required',
+          hint: `Send { "confirm": "${target.name}" }. Every project, generation, and file in it is removed.`,
+        },
+      });
+    }
+    const wasActive = id === ctx.workspace.id;
+    store.deleteWorkspace(id);
+    const remaining = store.listWorkspacesForUser(user.id);
+    if (!remaining.length) {
+      accounts.signOut(ctx.auth.token);
+      clearSessionCookie(req, res);
+      return json(res, 200, { deleted: true, signedOut: true });
+    }
+    if (wasActive) accounts.switchWorkspace(ctx.auth, remaining[0].id);
+    return json(res, 200, {
+      deleted: true,
+      workspace: wasActive ? { ...store.getWorkspace(remaining[0].id), role: remaining[0].role } : ctx.workspace,
+      workspaces: remaining.map(({ id: workspaceId, name, role }) => ({ id: workspaceId, name, role })),
+    });
+  }
+
+  if (group === 'members' && id && (req.method === 'PATCH' || req.method === 'DELETE')) {
+    // Leaving is not a management action — anyone may remove themselves.
+    guard(ctx, id === user.id && req.method === 'DELETE' ? 'read' : 'manage');
+    if (req.method === 'PATCH') {
+      const body = await readJsonBody(req);
+      return json(res, 200, { members: accounts.setMemberRole(ctx.auth, id, text(body.role, 20)) });
+    }
+    const members = accounts.removeMember(ctx.auth, id);
+    if (id === user.id) {
+      // They just removed themselves; the session pointed at this workspace.
+      clearSessionCookie(req, res);
+      return json(res, 200, { members, left: true });
+    }
+    return json(res, 200, { members });
+  }
+
+  if (group === 'invites' && id && req.method === 'DELETE') {
+    guard(ctx, 'manage');
+    return json(res, 200, { invites: accounts.revokeInvite(ctx.auth, id) });
+  }
+
+  if (group === 'me' && req.method === 'PATCH') {
+    const body = await readJsonBody(req);
+    if (body.password !== undefined) {
+      await accounts.changePassword(user, body.currentPassword, body.password);
+      clearSessionCookie(req, res);
+      return json(res, 200, { passwordChanged: true, signedOut: true, hint: 'Sign in again with your new password.' });
+    }
+    if (body.name !== undefined) {
+      const updated = store.setName(user.id, text(body.name, 80));
+      // Every membership row shows the name, so refresh what this session sees.
+      return json(res, 200, { user: updated, members: data.listMembers() });
+    }
+    return json(res, 200, { user });
+  }
+
   if (group === 'projects' && id) {
     if (!sub && req.method === 'GET') {
-      const project = store.getProject(id);
+      const project = data.getProject(id);
       if (!project) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
-      return json(res, 200, { project, generations: store.listGenerations({ projectId: id, limit: 20 }) });
+      return json(res, 200, { project, generations: data.listGenerations({ projectId: id, limit: 20 }) });
     }
     if (!sub && (req.method === 'PATCH' || req.method === 'PUT')) {
+      guard(ctx, 'write');
       const body = await readJsonBody(req);
-      const before = store.getProject(id);
-      const project = store.updateProject(id, {
+      const before = data.getProject(id);
+      const project = data.updateProject(id, {
         title: body.title,
         type: body.type,
         model: body.model,
@@ -500,32 +878,36 @@ async function handleItemRoute(req, res, pathname, url = new URL('http://localho
       });
       if (!project) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
       const statusChanged = before && body.status && before.status !== project.status;
-      if (statusChanged) fireEventAutomations('project.status', project.status, project);
-      return json(res, 200, { project, triggeredAutomations: statusChanged ? store.automationsForEvent('project.status', project.status).map((automation) => automation.name) : [] });
+      if (statusChanged) fireEventAutomations(data, 'project.status', project.status, project);
+      return json(res, 200, { project, triggeredAutomations: statusChanged ? data.automationsForEvent('project.status', project.status).map((automation) => automation.name) : [] });
     }
     if (!sub && req.method === 'DELETE') {
-      const archived = store.archiveProject(id);
+      guard(ctx, 'write');
+      const archived = data.archiveProject(id);
       if (!archived) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
-      return json(res, 200, { archived: true, projects: store.listProjects() });
+      return json(res, 200, { archived: true, projects: data.listProjects() });
     }
     if (sub === 'files' && req.method === 'GET') {
-      return json(res, 200, { files: store.filesForProject(id, 100) });
+      return json(res, 200, { files: data.filesForProject(id, 100) });
     }
     if (sub === 'duplicate' && req.method === 'POST') {
-      const project = store.duplicateProject(id);
+      guard(ctx, 'write');
+      const project = data.duplicateProject(id);
       if (!project) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
-      return json(res, 201, { project, projects: store.listProjects() });
+      return json(res, 201, { project, projects: data.listProjects() });
     }
   }
 
   if (group === 'prompts' && id && sub === 'use' && req.method === 'POST') {
-    const prompt = store.incrementPromptUses(id);
+    guard(ctx, 'write');
+    const prompt = data.incrementPromptUses(id);
     if (!prompt) return json(res, 404, { error: { message: 'Prompt not found', code: 'not_found' } });
     return json(res, 200, { prompt });
   }
 
   if (group === 'automations' && id) {
     if (!sub && (req.method === 'PATCH' || req.method === 'PUT')) {
+      guard(ctx, 'write');
       const body = await readJsonBody(req);
       const patch = {
         name: body.name,
@@ -538,30 +920,34 @@ async function handleItemRoute(req, res, pathname, url = new URL('http://localho
         if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
         patch.schedule = schedule;
       }
-      const automation = store.updateAutomation(id, patch, { timeZone: store.getSettings().timezone || 'UTC' });
+      const automation = data.updateAutomation(id, patch, { timeZone: data.getSettings().timezone || 'UTC' });
       if (!automation) return json(res, 404, { error: { message: 'Automation not found', code: 'not_found' } });
-      return json(res, 200, { automation: withRunLabel(automation), automations: store.listAutomations().map(withRunLabel) });
+      return json(res, 200, { automation: withRunLabel(automation), automations: data.listAutomations().map(withRunLabel) });
     }
-    if (sub === 'run' && req.method === 'POST') return runAutomation(res, id);
+    if (sub === 'run' && req.method === 'POST') {
+      guard(ctx, 'run');
+      return runAutomation(ctx, id);
+    }
     if (sub === 'runs' && req.method === 'GET') {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 10, 1), 100);
-      return json(res, 200, { runs: store.listAutomationRuns(id, limit) });
+      return json(res, 200, { runs: data.listAutomationRuns(id, limit) });
     }
   }
 
   if (group === 'files' && id) {
-    if (req.method === 'GET' || req.method === 'HEAD') return serveStoredFile(res, req, id, url.searchParams?.get('download') === '1');
+    if (req.method === 'GET' || req.method === 'HEAD') return serveStoredFile(ctx, id, url.searchParams?.get('download') === '1');
     if (req.method === 'DELETE') {
-      const removed = files.remove(id);
+      guard(ctx, 'write');
+      const removed = files.forWorkspace(data).remove(id);
       if (!removed) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
-      return json(res, 200, { deleted: true, storage: files.stats() });
+      return json(res, 200, { deleted: true, storage: data.fileStats() });
     }
   }
 
   if (group === 'generations' && id && req.method === 'GET') {
-    const generation = store.getGeneration(id);
+    const generation = data.getGeneration(id);
     if (!generation) return json(res, 404, { error: { message: 'Generation not found', code: 'not_found' } });
-    return json(res, 200, { generation, files: store.filesForGeneration(id) });
+    return json(res, 200, { generation, files: data.filesForGeneration(id) });
   }
 
   return json(res, 404, { error: { message: `No API route for ${req.method} ${pathname}`, code: 'not_found' } });
@@ -571,29 +957,30 @@ async function handleItemRoute(req, res, pathname, url = new URL('http://localho
  * "Run now" goes through the same executor the scheduler uses, so manual and
  * scheduled runs are recorded identically.
  */
-async function runAutomation(res, id) {
-  const automation = store.getAutomation(id);
+async function runAutomation(ctx, id) {
+  const { res, data } = ctx;
+  const automation = data.getAutomation(id);
   if (!automation) return json(res, 404, { error: { message: 'Automation not found', code: 'not_found' } });
 
-  const result = await automations.execute({ automation, source: 'manual' });
+  const result = await automations.execute({ automation, source: 'manual', data });
   if (result.status === 'failed') {
     return json(res, 502, { error: { message: result.message, code: 'automation_failed' }, status: 'failed', output: result.output });
   }
 
   // A manual run shifts the clock forward, so pressing Run never causes a
   // duplicate scheduled run minutes later.
-  const settings = store.getSettings();
-  store.setNextRun(id, nextRunIso(automation, settings.timezone));
+  const settings = data.getSettings();
+  data.setNextRun(id, nextRunIso(automation, settings.timezone));
 
   json(res, 200, {
-    automation: withRunLabel(store.getAutomation(id)),
-    automations: store.listAutomations().map(withRunLabel),
+    automation: withRunLabel(data.getAutomation(id)),
+    automations: data.listAutomations().map(withRunLabel),
     status: result.status,
     message: result.message,
     generation: result.generation,
     output: result.output,
     isDemo: result.isDemo,
-    usage: store.usageSummary(),
+    usage: data.usageSummary(),
   });
 }
 
@@ -669,12 +1056,17 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
   const started = Date.now();
 
-  // Same-origin by default; permissive CORS so a separately hosted front end
-  // can use the API. No credentials are involved — provider keys stay server-side.
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  /**
+   * The API now authenticates with a cookie, so it is same-origin only: no
+   * `Access-Control-Allow-Origin`, no credential sharing, nothing for another
+   * site to call with the user's session attached.
+   */
+  res.setHeader('Access-Control-Allow-Origin', 'same-origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Vary', 'Origin');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
@@ -684,23 +1076,49 @@ const server = http.createServer(async (req, res) => {
       return serveStatic(req, res, pathname);
     }
 
+    // A stream can outlive the browser tab that started it. Without this, the
+    // socket's 'error' event is unhandled and takes the whole server down.
+    res.on('error', (error) => {
+      if (error?.code !== 'ERR_STREAM_WRITE_AFTER_END' && error?.code !== 'EPIPE') {
+        console.error('Response error:', error?.message);
+      }
+    });
+
+    const ctx = buildContext(req, res, url, pathname);
+
+    /**
+     * A cookie is ambient: the browser attaches it to any request that reaches
+     * this origin. So every state-changing call has to prove it came from our
+     * own pages. Bearer-token clients (scripts, tests) are exempt because they
+     * hold the token deliberately rather than inheriting it.
+     */
+    const mutating = req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS';
+    const usesCookie = Boolean(parseCookiesHeader(req.headers.cookie)[accounts.cookieName]);
+    if (mutating && usesCookie && !sameOrigin(req)) {
+      return json(res, 403, { error: { message: 'That request came from another site.', code: 'cross_origin', hint: 'Reload the Studio and try again.' } });
+    }
+
     if (pathname === '/api/generate' && req.method === 'POST') {
-      await handleGenerate(req, res);
+      await handleGenerate(ctx);
       return logRequest(req, pathname, 200, started);
     }
 
     const handler = routes[`${req.method} ${pathname}`];
     if (handler) {
-      await handler({ req, res, url, pathname });
+      await handler(ctx);
       return logRequest(req, pathname, res.statusCode, started);
     }
-    await handleItemRoute(req, res, pathname, url);
+    await handleItemRoute(ctx);
     logRequest(req, pathname, res.statusCode, started);
   } catch (error) {
     if (res.headersSent) {
-      // A stream already started: report the failure inside the stream.
-      res.write(`event: error\ndata: ${JSON.stringify({ message: error?.message || 'Stream failed', code: error?.code || 'stream_error' })}\n\n`);
-      res.end();
+      if (!res.writableEnded) {
+        // A stream already started: report the failure inside the stream.
+        res.write(`event: error\ndata: ${JSON.stringify({ message: error?.message || 'Stream failed', code: error?.code || 'stream_error' })}\n\n`);
+        res.end();
+      } else {
+        console.error(`Generation stream failed after it closed: ${error?.message}`);
+      }
       return logRequest(req, pathname, 500, started);
     }
     fail(res, error);
@@ -743,6 +1161,12 @@ server.listen(config.port, config.host, () => {
   console.log(`  → uploads:  ${config.uploadsDir}`);
   console.log(`  → ${mode}`);
   if (gateway.isDemoOnly()) console.log('  → add a provider key to .env for real generation (see .env.example)');
+  if (accounts.isFirstRun()) {
+    console.log('  → no accounts yet: the first sign-up claims the seeded workspace');
+  } else {
+    const accountCount = store.countUsers();
+    console.log(`  → ${accountCount} account${accountCount === 1 ? '' : 's'} · sign in to continue`);
+  }
 
   // Catch up on anything that came due while the server was off, once.
   scheduler.tickOnce({ reason: 'startup' }).catch((error) => console.error('Startup schedule check failed:', error.message));

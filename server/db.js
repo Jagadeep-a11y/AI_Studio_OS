@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { SEED_ACTIVITY, SEED_AUTOMATIONS, SEED_PROJECTS, SEED_PROMPTS, SEED_SETTINGS } from './seed.js';
 import { describeSchedule, nextOccurrence } from './schedule.js';
+import { initialsFor } from './auth.js';
 
 /**
  * SQLite persistence layer.
@@ -40,6 +41,7 @@ export function relativeTime(value) {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
   id          TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   title       TEXT NOT NULL,
   type        TEXT NOT NULL DEFAULT 'Campaign',
   model       TEXT NOT NULL DEFAULT 'Auto select',
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS generations (
   id           TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   project_id   TEXT REFERENCES projects(id) ON DELETE SET NULL,
   provider     TEXT NOT NULL,
   model_id     TEXT NOT NULL,
@@ -78,6 +81,7 @@ CREATE INDEX IF NOT EXISTS generations_project_idx ON generations (project_id);
 
 CREATE TABLE IF NOT EXISTS prompts (
   id         TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   title      TEXT NOT NULL,
   category   TEXT NOT NULL,
   icon       TEXT NOT NULL DEFAULT 'sparkles',
@@ -89,6 +93,7 @@ CREATE TABLE IF NOT EXISTS prompts (
 
 CREATE TABLE IF NOT EXISTS automations (
   id           TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   name         TEXT NOT NULL,
   description  TEXT NOT NULL DEFAULT '',
   trigger      TEXT NOT NULL DEFAULT 'On demand',
@@ -114,6 +119,7 @@ CREATE TABLE IF NOT EXISTS automation_runs (
 
 CREATE TABLE IF NOT EXISTS files (
   id            TEXT PRIMARY KEY,
+  workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   name          TEXT NOT NULL,
   mime          TEXT NOT NULL,
   size          INTEGER NOT NULL DEFAULT 0,
@@ -124,11 +130,11 @@ CREATE TABLE IF NOT EXISTS files (
   generation_id TEXT REFERENCES generations(id) ON DELETE SET NULL,
   created_at    TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS files_project_idx ON files (project_id);
-CREATE INDEX IF NOT EXISTS files_generation_idx ON files (generation_id);
+
 
 CREATE TABLE IF NOT EXISTS activity (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id TEXT NOT NULL,
   icon       TEXT NOT NULL DEFAULT 'sparkles',
   tone       TEXT NOT NULL DEFAULT '',
   line       TEXT NOT NULL,
@@ -136,10 +142,81 @@ CREATE TABLE IF NOT EXISTS activity (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS settings (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS workspaces (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  owner_id   TEXT REFERENCES users(id) ON DELETE SET NULL,
+  plan       TEXT NOT NULL DEFAULT 'Studio plan',
+  created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  email         TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  avatar        TEXT NOT NULL DEFAULT '',
+  created_at    TEXT NOT NULL,
+  last_seen_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role         TEXT NOT NULL DEFAULT 'editor',
+  created_at   TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workspace_id TEXT,
+  created_at   TEXT NOT NULL,
+  last_used_at TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  user_agent   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions (user_id);
+
+CREATE TABLE IF NOT EXISTS invites (
+  id           TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  email        TEXT NOT NULL,
+  role         TEXT NOT NULL DEFAULT 'editor',
+  token_hash   TEXT NOT NULL,
+  invited_by   TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  accepted_at  TEXT,
+  accepted_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS invites_workspace_idx ON invites (workspace_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+  workspace_id TEXT NOT NULL,
+  key   TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, key)
+);
+`;
+
+/**
+ * Indexes are created *after* the migration, never inside SCHEMA: an index on a
+ * column that an older database only gains during migration would otherwise fail
+ * the whole schema exec (“no such column”), which is how a studio that predates
+ * workspaces would stop booting.
+ */
+const INDEXES = `
+CREATE INDEX IF NOT EXISTS projects_workspace_idx ON projects (workspace_id);
+CREATE INDEX IF NOT EXISTS generations_workspace_idx ON generations (workspace_id);
+CREATE INDEX IF NOT EXISTS prompts_workspace_idx ON prompts (workspace_id);
+CREATE INDEX IF NOT EXISTS automations_workspace_idx ON automations (workspace_id);
+CREATE INDEX IF NOT EXISTS files_workspace_idx ON files (workspace_id);
+CREATE INDEX IF NOT EXISTS activity_workspace_idx ON activity (workspace_id);
+CREATE INDEX IF NOT EXISTS files_project_idx ON files (project_id);
+CREATE INDEX IF NOT EXISTS files_generation_idx ON files (generation_id);
 `;
 
 export function openDatabase(dbPath) {
@@ -151,6 +228,7 @@ export function openDatabase(dbPath) {
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
   migrate(db);
+  db.exec(INDEXES);
   seedIfEmpty(db);
   return db;
 }
@@ -172,40 +250,109 @@ function migrate(db) {
   addColumn('automations', 'trigger_label', "TEXT NOT NULL DEFAULT 'Manual only'");
   addColumn('automations', 'next_run_at', 'TEXT');
   addColumn('automations', 'last_status', 'TEXT');
+
+  // Tenancy: every row of content belongs to a workspace. Adding the columns is
+  // additive; the backfill below decides which workspace the old rows belong to.
+  for (const table of ['projects', 'generations', 'prompts', 'automations', 'files', 'activity']) {
+    addColumn(table, 'workspace_id', 'TEXT');
+  }
+  migrateSettingsToWorkspaces(db);
+  backfillLegacyWorkspace(db);
+}
+
+/**
+ * `settings` used to be a global key/value table. Workspaces each have their own
+ * preferences now, so the primary key has to gain a column — which SQLite can
+ * only do by rebuilding the table. Old values are copied, never dropped.
+ */
+function migrateSettingsToWorkspaces(db) {
+  const columns = db.prepare('PRAGMA table_info(settings)').all().map((row) => row.name);
+  if (columns.includes('workspace_id')) return;
+
+  const legacy = db.prepare('SELECT key, value FROM settings').all();
+  db.exec('ALTER TABLE settings RENAME TO settings_legacy;');
+  db.exec(`
+    CREATE TABLE settings (
+      workspace_id TEXT NOT NULL,
+      key   TEXT NOT NULL,
+      value TEXT NOT NULL,
+      PRIMARY KEY (workspace_id, key)
+    );`);
+  const workspace = ensureLegacyWorkspace(db, legacy);
+  const insert = db.prepare('INSERT OR REPLACE INTO settings (workspace_id, key, value) VALUES (?, ?, ?)');
+  for (const row of legacy) insert.run(workspace.id, row.key, row.value);
+  db.exec('DROP TABLE settings_legacy;');
+}
+
+/**
+ * A database that predates accounts has content but nobody to own it. Rather
+ * than inventing a user with a password nobody knows, the content is parked in a
+ * workspace with no members: the next account created claims it (see
+ * `adoptOrphanWorkspace` in the store). That keeps the demo workspace reachable
+ * without shipping a default password.
+ */
+function ensureLegacyWorkspace(db, legacySettings = []) {
+  const existing = db.prepare('SELECT * FROM workspaces ORDER BY created_at ASC LIMIT 1').get();
+  if (existing) return existing;
+
+  const name = (legacySettings.find((row) => row.key === 'workspace')?.value
+    || db.prepare("SELECT value FROM settings WHERE key = 'workspace'").get()?.value
+    || 'Northstar Studio');
+  const id = newId('w');
+  db.prepare('INSERT INTO workspaces (id, name, owner_id, plan, created_at) VALUES (?, ?, NULL, ?, ?)')
+    .run(id, name, 'Studio plan', nowIso());
+  return db.prepare('SELECT * FROM workspaces WHERE id = ?').get(id);
+}
+
+function backfillLegacyWorkspace(db) {
+  const orphans = db.prepare('SELECT COUNT(*) AS count FROM projects WHERE workspace_id IS NULL').get();
+  const total = db.prepare('SELECT COUNT(*) AS count FROM projects').get();
+  if (!total.count || !orphans.count) return;
+
+  const workspace = ensureLegacyWorkspace(db);
+  for (const table of ['projects', 'generations', 'prompts', 'automations', 'files', 'activity']) {
+    db.prepare(`UPDATE ${table} SET workspace_id = ? WHERE workspace_id IS NULL`).run(workspace.id);
+  }
 }
 
 function seedIfEmpty(db) {
   const { count } = db.prepare('SELECT COUNT(*) AS count FROM projects').get();
   if (count > 0) return;
 
-  const insertProject = db.prepare(`INSERT INTO projects (id, title, type, model, status, prompt, art, outputs, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  // The demo workspace starts with no members: the first person to sign up
+  // adopts it, so the seeded studio is never owned by a password we shipped.
+  const workspaceId = newId('w');
+  db.prepare('INSERT INTO workspaces (id, name, owner_id, plan, created_at) VALUES (?, ?, NULL, ?, ?)')
+    .run(workspaceId, SEED_SETTINGS.workspace || 'Northstar Studio', 'Studio plan', nowIso());
+
+  const insertProject = db.prepare(`INSERT INTO projects (id, workspace_id, title, type, model, status, prompt, art, outputs, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const project of SEED_PROJECTS) {
     const created = minutesAgoIso(project.ageMinutes + 240);
-    insertProject.run(project.id, project.title, project.type, project.model, project.status, project.prompt, project.art, project.outputs, created, minutesAgoIso(project.ageMinutes));
+    insertProject.run(project.id, workspaceId, project.title, project.type, project.model, project.status, project.prompt, project.art, project.outputs, created, minutesAgoIso(project.ageMinutes));
   }
 
-  const insertPrompt = db.prepare('INSERT INTO prompts (id, title, category, icon, mode, body, uses, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-  for (const prompt of SEED_PROMPTS) insertPrompt.run(prompt.id, prompt.title, prompt.category, prompt.icon, prompt.mode, prompt.text, prompt.uses, minutesAgoIso(5_000));
+  const insertPrompt = db.prepare('INSERT INTO prompts (id, workspace_id, title, category, icon, mode, body, uses, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  for (const prompt of SEED_PROMPTS) insertPrompt.run(prompt.id, workspaceId, prompt.title, prompt.category, prompt.icon, prompt.mode, prompt.text, prompt.uses, minutesAgoIso(5_000));
 
   const insertAutomation = db.prepare(`INSERT INTO automations
-    (id, name, description, trigger, trigger_label, schedule, next_run_at, action, last_run, enabled, tone, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    (id, workspace_id, name, description, trigger, trigger_label, schedule, next_run_at, action, last_run, enabled, tone, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const automation of SEED_AUTOMATIONS) {
     const schedule = automation.schedule || { type: 'manual' };
     const nextRun = nextOccurrence(schedule, Date.now(), SEED_SETTINGS.timezone);
     insertAutomation.run(
-      automation.id, automation.name, automation.description, automation.trigger, describeSchedule(schedule),
+      automation.id, workspaceId, automation.name, automation.description, automation.trigger, describeSchedule(schedule),
       JSON.stringify(schedule), nextRun ? new Date(nextRun).toISOString() : null,
       automation.action, null, automation.enabled ? 1 : 0, automation.tone, minutesAgoIso(9_000),
     );
   }
 
-  const insertActivity = db.prepare('INSERT INTO activity (icon, tone, line, project, created_at) VALUES (?, ?, ?, ?, ?)');
-  for (const item of SEED_ACTIVITY) insertActivity.run(item.icon, item.tone, item.line, item.project, minutesAgoIso(item.ageMinutes));
+  const insertActivity = db.prepare('INSERT INTO activity (workspace_id, icon, tone, line, project, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  for (const item of SEED_ACTIVITY) insertActivity.run(workspaceId, item.icon, item.tone, item.line, item.project, minutesAgoIso(item.ageMinutes));
 
-  const insertSetting = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)');
-  for (const [key, value] of Object.entries(SEED_SETTINGS)) insertSetting.run(key, String(value));
+  const insertSetting = db.prepare('INSERT INTO settings (workspace_id, key, value) VALUES (?, ?, ?)');
+  for (const [key, value] of Object.entries(SEED_SETTINGS)) insertSetting.run(workspaceId, key, String(value));
 }
 
 // --- Row shaping ------------------------------------------------------------
@@ -302,6 +449,50 @@ export function fileFromRow(row) {
     url: `/api/files/${row.id}`,
     isImage: String(row.mime || '').startsWith('image/'),
     createdLabel: relativeTime(row.created_at),
+  };
+}
+
+export function userFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    avatar: row.avatar || '',
+    initials: initialsFor(row.name, row.email),
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at || null,
+  };
+}
+
+export function workspaceFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    ownerId: row.owner_id || null,
+    plan: row.plan || 'Studio plan',
+    createdAt: row.created_at,
+  };
+}
+
+export function membershipFromRow(row) {
+  if (!row) return null;
+  return { workspaceId: row.workspace_id, userId: row.user_id, role: row.role, createdAt: row.created_at };
+}
+
+export function inviteFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    email: row.email,
+    role: row.role,
+    invitedBy: row.invited_by || null,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    acceptedAt: row.accepted_at || null,
+    status: row.accepted_at ? 'accepted' : (Date.parse(row.expires_at) < Date.now() ? 'expired' : 'pending'),
   };
 }
 

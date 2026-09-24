@@ -12,9 +12,36 @@ Errors use one shape, and include a hint the UI shows verbatim:
              "provider": "anthropic" } }
 ```
 
+## Authentication
+
+Every endpoint below except `GET /api/health`, `GET /api/auth/session`, and the two invite-accept
+routes requires a signed-in member of a workspace. The session is a cookie (`studio_session`,
+`HttpOnly`, `SameSite=Lax`, 30-day sliding expiry) or the same token as
+`Authorization: Bearer <token>`. A missing or expired session answers `401` with
+`code: "unauthenticated"`; a session without permission for the action answers `403` with
+`code: "forbidden"` and a hint naming the role that would be needed.
+
+Cookie-authenticated writes must also be same-origin — a request carrying `Origin`/`Referer` for
+another host is refused with `code: "cross_origin"`. Non-browser clients (curl, tests) send no
+`Origin` and are unaffected, because they cannot send an ambient cookie.
+
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /api/health` | Liveness, mode, provider summary (`?probe=1` also tests each key) |
+| `GET /api/health` | Liveness, mode, provider summary (`?probe=1` also tests each key) — public |
+| `GET /api/auth/session` | Who am I: user, workspaces, role, capabilities — public, `authenticated: false` when signed out |
+| `POST /api/auth/signup` | Create the first account (claims the seeded workspace) or a new one |
+| `POST /api/auth/login` / `POST /api/auth/logout` | Start and end a session |
+| `PATCH /api/me` | Rename yourself, or change your password (which signs out every session) |
+| `GET /api/workspaces` · `POST /api/workspaces` | List / create (and switch to) a workspace |
+| `POST /api/workspaces/switch` | Make another of your workspaces active |
+| `PATCH /api/workspaces/:id` | Rename, set the plan, or `transferTo` a member |
+| `DELETE /api/workspaces/:id` | Delete it — requires `{ "confirm": "<exact name>" }` |
+| `GET /api/members` | Members, pending invites, and the roles you may assign |
+| `PATCH /api/members/:id` · `DELETE /api/members/:id` | Change a role / remove (yourself included) |
+| `POST /api/invites` | Invite someone by email, as admin, editor, or viewer |
+| `GET /api/invites/:token` | Describe an invite — public, for the acceptance screen |
+| `POST /api/invites/:token/accept` | Join the workspace (creates the account, or uses your session) |
+| `DELETE /api/invites/:id` | Revoke a pending invite |
 | `GET /api/bootstrap` | Everything the UI needs to boot, in one call |
 | `GET /api/models` | Model catalogue (`?refresh=1` forces rediscovery) |
 | `GET /api/projects` | Projects (`?archived=1` includes archived) |
@@ -46,11 +73,12 @@ Errors use one shape, and include a hint the UI shows verbatim:
 
 ## `GET /api/bootstrap`
 
-One round trip for the whole workspace: mode, providers, models, projects, prompts, automations,
-activity, settings, usage, and capability flags.
+One round trip for the whole workspace: who you are, the workspaces you can reach, the members of
+the active one, then mode, providers, models, projects, prompts, automations, activity, settings,
+usage, and capability flags. It requires a session — signed out it answers `401`.
 
 ```bash
-curl -s localhost:4173/api/bootstrap | jq '{mode, projects: (.projects|length), models: (.models|length)}'
+curl -s -b cookies.txt localhost:4173/api/bootstrap | jq '{user: .user.name, role, workspace: .workspace.name, projects: (.projects|length)}'
 ```
 
 ```json
@@ -66,7 +94,9 @@ curl -s localhost:4173/api/bootstrap | jq '{mode, projects: (.projects|length), 
   "capabilities": { "generation": true, "streaming": true, "persistence": "sqlite",
                     "imageGeneration": true, "realProviders": false,
                     "fileUploads": true, "attachments": true, "fileStorage": "local-disk",
-                    "billing": false, "scheduling": true, "eventTriggers": true } }
+                    "billing": false, "scheduling": true, "eventTriggers": true,
+                    "accounts": true, "teams": true, "invites": true,
+                    "roles": ["owner", "admin", "editor", "viewer"], "sessions": "cookie" } }
 ```
 
 `selectable` is false when the model's provider has no key. `verified` is `true`/`false` when the
@@ -248,3 +278,10 @@ pressing Run never causes a duplicate run minutes later.
   anything is written to disk.
 - Changing a project's `status` to a value an event automation watches fires that automation in the
   background — the `PATCH` response returns immediately and lists what it triggered.
+- Everything workspace-owned is addressed inside the active workspace. Asking for a project,
+  generation, file, or automation that lives in a workspace you belong to but are not currently in
+  answers `404`, exactly like an id that never existed. Switch first, then ask.
+- Pending invites are only included in `GET /api/members` and `GET /api/bootstrap` for owners and
+  admins: they contain email addresses that a viewer has no reason to see.
+- A generation run by a viewer is refused with the same `403` as any other write — running costs
+  credits, so it counts as writing.

@@ -140,6 +140,15 @@ Event types an adapter may yield: `delta`, `usage`, `notice`. The gateway adds `
 
 ---
 
+## Keys, accounts, and who may spend credits
+
+Provider keys stay in `.env` and are read by the server only; no endpoint ever returns one, and the
+browser cannot ask for one. Accounts do not change that — what they add is the question of *who*
+may spend those credits. Any member with **editor** or above in the active workspace can run a
+generation; a viewer's request is refused (`403`) before the gateway is consulted, so a read-only
+teammate can never consume a key. Usage rows carry the workspace id, so `GET /api/usage` totals per
+workspace rather than per server.
+
 ## Providers in this build
 
 | Provider | Auth | Text | Image | Vision (uploads) | Discovery | Notes |

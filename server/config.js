@@ -141,6 +141,21 @@ export const config = {
 
 config.uploadsDir = resolveUploadsDir(str('AI_STUDIO_UPLOADS', ''), config.dbPath);
 
+/**
+ * Accounts and sessions. The defaults are sized for a small studio: a month-long
+ * sliding session, week-long invites, and sign-in throttling that stops a
+ * password-guessing loop without locking anyone out of their own workspace.
+ */
+config.auth = {
+  sessionTtlDays: Math.min(365, Math.max(1, num('AI_STUDIO_SESSION_TTL_DAYS', 30))),
+  inviteTtlDays: Math.min(90, Math.max(1, num('AI_STUDIO_INVITE_TTL_DAYS', 7))),
+  allowSignups: bool('AI_STUDIO_ALLOW_SIGNUPS', true),
+  loginMaxAttempts: Math.max(3, num('AI_STUDIO_LOGIN_MAX_ATTEMPTS', 10)),
+  signupMaxAttempts: Math.max(3, num('AI_STUDIO_SIGNUP_MAX_ATTEMPTS', 10)),
+  loginWindowMs: Math.max(60_000, num('AI_STUDIO_LOGIN_WINDOW_MS', 15 * 60_000)),
+  maxWorkspacesPerUser: Math.max(1, num('AI_STUDIO_MAX_WORKSPACES', 10)),
+};
+
 /** Secrets never travel to the browser; this is the only shape clients ever see. */
 export function providerSummary() {
   return [

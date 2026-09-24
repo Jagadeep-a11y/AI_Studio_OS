@@ -18,7 +18,7 @@ import { nextOccurrence } from './schedule.js';
  *   • Failures back off, they do not storm. A failed run moves the next attempt
  *     out by the backoff window instead of retrying immediately.
  */
-export function createScheduler({ store, runner, config, logger = console }) {
+export function createScheduler({ store, accounts, runner, config, logger = console }) {
   const { enabled, tickMs, maxPerTick, backoffMs } = config.scheduler;
   const state = {
     enabled,
@@ -33,19 +33,30 @@ export function createScheduler({ store, runner, config, logger = console }) {
     timer: null,
   };
 
-  const timeZone = () => store.getSettings().timezone || 'UTC';
   const isoOf = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 
-  async function runOne(automation, dueAt) {
+  /**
+   * Every workspace runs its own clock. The scheduler walks them in turn:
+   * one slow provider in one workspace cannot hold up another workspace's
+   * schedules, and the per-tick ceiling applies to each of them separately.
+   */
+  const activeWorkspaces = () => {
+    const ids = store.db.prepare('SELECT DISTINCT workspace_id AS id FROM automations WHERE workspace_id IS NOT NULL').all();
+    return ids.map((row) => store.forWorkspace(row.id)).filter((data) => data.workspaceId);
+  };
+
+  async function runOne(data, automation, dueAt) {
     // Claim the window first: if anything below throws, the schedule still moved.
-    store.setNextRun(automation.id, isoOf(Date.now() + backoffMs));
+    const timeZone = () => data.getSettings().timezone || 'UTC';
+
+    data.setNextRun(automation.id, isoOf(Date.now() + backoffMs));
     state.running = true;
     const started = Date.now();
     try {
-      const result = await runner.execute({ automation, source: 'scheduled' });
+      const result = await runner.execute({ automation, source: 'scheduled', data });
       const finishedAt = Date.now();
       const next = nextOccurrence(automation.schedule, finishedAt, timeZone());
-      store.setNextRun(automation.id, isoOf(next));
+      data.setNextRun(automation.id, isoOf(next));
 
       if (result.status === 'failed') {
         state.failures += 1;
@@ -56,13 +67,13 @@ export function createScheduler({ store, runner, config, logger = console }) {
         state.runs += 1;
         logger.log(`⟳ “${automation.name}” ran in ${finishedAt - started}ms${result.isDemo ? ' (demo engine)' : ''}`);
       }
-      return { automation: automation.name, dueAt, status: result.status, next: isoOf(next) };
+      return { automation: automation.name, workspace: data.workspaceId, dueAt, status: result.status, next: isoOf(next) };
     } catch (error) {
       state.failures += 1;
       const next = nextOccurrence(automation.schedule, Date.now() + backoffMs, timeZone());
-      store.setNextRun(automation.id, isoOf(next));
+      data.setNextRun(automation.id, isoOf(next));
       logger.error(`⟳ “${automation.name}” threw: ${error.message}`);
-      return { automation: automation.name, dueAt, status: 'error', message: error.message, next: isoOf(next) };
+      return { automation: automation.name, workspace: data.workspaceId, dueAt, status: 'error', message: error.message, next: isoOf(next) };
     } finally {
       state.running = false;
     }
@@ -75,17 +86,21 @@ export function createScheduler({ store, runner, config, logger = console }) {
     state.ticks += 1;
     state.lastTickAt = new Date().toISOString();
     const outcomes = [];
+    let dueCount = 0;
     try {
-      const due = store.dueAutomations(new Date().toISOString(), maxPerTick);
-      for (const automation of due) {
-        if (!automation.schedule || !['interval', 'daily', 'monthly'].includes(automation.schedule.type)) {
-          // Event-driven or manual rows should not hold a clock at all.
-          store.setNextRun(automation.id, null);
-          continue;
+      for (const data of activeWorkspaces()) {
+        const due = data.dueAutomations(new Date().toISOString(), maxPerTick);
+        dueCount += due.length;
+        for (const automation of due) {
+          if (!automation.schedule || !['interval', 'daily', 'monthly'].includes(automation.schedule.type)) {
+            // Event-driven or manual rows should not hold a clock at all.
+            data.setNextRun(automation.id, null);
+            continue;
+          }
+          outcomes.push(await runOne(data, automation, automation.nextRunAt));
         }
-        outcomes.push(await runOne(automation, automation.nextRunAt));
       }
-      state.lastResult = { reason, due: due.length, outcomes, at: state.lastTickAt };
+      state.lastResult = { reason, due: dueCount, outcomes, at: state.lastTickAt };
       return state.lastResult;
     } finally {
       state.ticking = false;
@@ -111,15 +126,19 @@ export function createScheduler({ store, runner, config, logger = console }) {
   }
 
   /** Status shown in Settings → Connections. */
-  function status() {
-    const next = store.scheduledAutomations()
-      .filter((automation) => automation.nextRunAt && automation.enabled)
-      .sort((a, b) => String(a.nextRunAt).localeCompare(String(b.nextRunAt)))[0] || null;
+  function status(workspaceId = null) {
+    const data = workspaceId ? store.forWorkspace(workspaceId) : null;
+    const next = data
+      ? data.scheduledAutomations()
+        .filter((automation) => automation.nextRunAt && automation.enabled)
+        .sort((a, b) => String(a.nextRunAt).localeCompare(String(b.nextRunAt)))[0] || null
+      : null;
     return {
       enabled,
       active: Boolean(state.timer),
       tickMs,
-      timeZone: timeZone(),
+      timeZone: data ? (data.getSettings().timezone || 'UTC') : 'UTC',
+      workspaces: activeWorkspaces().length,
       startedAt: state.startedAt,
       lastTickAt: state.lastTickAt,
       lastResult: state.lastResult,
@@ -128,5 +147,12 @@ export function createScheduler({ store, runner, config, logger = console }) {
     };
   }
 
-  return { start, stop, tickOnce, status, scheduleOf: (schedule, fromMs) => nextOccurrence(schedule, fromMs, timeZone()) };
+  return {
+    start,
+    stop,
+    tickOnce,
+    status,
+    /** Exposed for tests: what would this schedule do next, in this workspace? */
+    scheduleOf: (schedule, fromMs, timeZone = 'UTC') => nextOccurrence(schedule, fromMs, timeZone),
+  };
 }

@@ -707,3 +707,90 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 .schedule-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
 .schedule-fields[hidden] { display: none; }
+
+/* ---------------------------------------------------------------------------
+   Accounts: sign-in gate, team page, and the signed-in chrome
+   --------------------------------------------------------------------------- */
+
+/* The shell stays behind the gate until the server says who you are. */
+body.is-locked .app-shell { display: none; }
+body.is-locked { background: radial-gradient(120% 90% at 15% -10%, #241f45 0%, #14131f 55%, #0f0e17 100%); }
+
+.auth-screen { position: fixed; z-index: 120; inset: 0; display: flex; align-items: center; justify-content: center; padding: 32px 20px; overflow-y: auto; background: inherit; }
+.auth-panel { width: min(560px, 100%); }
+.auth-brand { display: flex; align-items: center; gap: 11px; margin: 0 0 20px 4px; color: #fff; }
+.auth-brand .brand-mark { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 10px; background: linear-gradient(140deg, #8b6cf6, #5b3fd8); }
+.auth-brand .brand-mark .icon { width: 18px; height: 18px; color: #fff; }
+.auth-brand .brand-wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 700; letter-spacing: -.2px; }
+.auth-brand .brand-wordmark span { color: #9a86ff; }
+.auth-brand .brand-wordmark small { display: block; margin-top: 2px; color: #8f8ba6; font-size: 7px; font-weight: 600; letter-spacing: 1.6px; }
+
+.auth-card { padding: 30px; border: 1px solid #efeefa; border-radius: 18px; background: #fff; box-shadow: 0 26px 70px rgba(9, 7, 24, .45); }
+.auth-eyebrow { display: flex; align-items: center; gap: 7px; color: #7a5ce8; font-size: 9px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; }
+.auth-eyebrow .icon { width: 14px; height: 14px; }
+.auth-card h1 { margin: 12px 0 10px; color: #26243a; font-family: var(--font-display); font-size: 26px; line-height: 1.2; letter-spacing: -.6px; }
+.auth-card h1 em { color: #6d4ff0; font-style: normal; }
+.auth-lede { margin: 0 0 20px; color: #74717f; font-size: 11px; line-height: 1.7; }
+.auth-lede strong { color: #4a4760; }
+.auth-form { display: grid; gap: 13px; }
+.auth-form .form-field input { min-height: 44px; font-size: 12px; }
+.auth-error { padding: 9px 11px; border: 1px solid #f3d3d3; border-radius: 8px; background: #fdf5f5; color: #b1444a; font-size: 10px; }
+.auth-error[hidden] { display: none; }
+.auth-submit { min-height: 44px; justify-content: center; font-size: 12px; }
+.auth-foot { margin: 16px 0 0; color: #8d8a99; font-size: 10px; }
+.auth-offline { margin-top: 8px; }
+.link-button { padding: 0; border: 0; background: transparent; color: #6d4ff0; cursor: pointer; font-weight: 600; text-decoration: underline; }
+
+.readonly-note { display: flex; gap: 10px; align-items: flex-start; margin: 0 0 12px; padding: 13px 15px; border: 1px solid #e6e2f8; border-radius: 10px; background: #f7f5ff; color: #5b5871; font-size: 10px; line-height: 1.6; }
+.readonly-note .icon { flex: none; width: 15px; height: 15px; color: #7a5ce8; }
+.readonly-note strong { color: #3c3952; }
+
+.role-pill { padding: 4px 9px; border: 1px solid #e7e5f2; border-radius: 999px; background: #f7f6ff; color: #6b5ab5; font-size: 8px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+.role-pill.is-readonly { border-color: #f0e2c8; background: #fdf8ef; color: #8d6a2c; }
+
+.popover-account { padding: 0 8px 8px; color: #9d9aa8; font-size: 9px; }
+.popover-hint { margin-left: auto; color: #a5a2b1; font-size: 8px; }
+.popover-empty { padding: 8px; color: #a5a2b1; font-size: 9px; }
+.popover-danger { color: #b8484f; }
+.popover-danger .icon { color: #c25b62; }
+.popover-danger:hover { background: #fdf4f4; }
+
+.badge-soft { color: #6f6c85; border-color: #eae8f4; background: #f7f6fc; }
+
+.team-grid { display: grid; gap: 16px; grid-template-columns: 1.35fr 1fr; align-items: start; margin-bottom: 16px; }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.card-head h2 { margin: 0 0 4px; color: #393748; font-family: var(--font-display); font-size: 13px; }
+.card-head p { margin: 0; color: #92909d; font-size: 9px; }
+
+.member-list, .invite-list { display: grid; gap: 4px; }
+.member-row, .invite-row { display: flex; align-items: center; gap: 11px; padding: 10px 4px; border-bottom: 1px solid #f4f3f8; }
+.member-row:last-child, .invite-row:last-child { border-bottom: 0; }
+.member-avatar { display: grid; flex: none; width: 34px; height: 34px; place-items: center; border-radius: 10px; background: linear-gradient(135deg, #efeaff, #e3dcff); color: #6046d6; font-size: 11px; font-weight: 700; }
+.member-avatar.is-pending { background: #f6f5fa; color: #9d9aa8; }
+.member-avatar .icon { width: 15px; height: 15px; }
+.member-main { min-width: 0; flex: 1; }
+.member-main h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 3px; color: #3a3849; font-size: 10px; font-weight: 600; }
+.member-main p { margin: 0; overflow: hidden; color: #9a97a6; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.member-side { display: flex; align-items: center; gap: 6px; }
+.role-select { min-height: 30px; padding: 0 8px; color: #55536a; border: 1px solid #e9e8ef; border-radius: 7px; background: #fff; font-size: 9px; cursor: pointer; }
+
+.role-legend { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }
+.role-legend li { display: flex; align-items: flex-start; gap: 9px; color: #83808f; font-size: 9px; line-height: 1.6; }
+.role-legend .badge { flex: none; }
+
+.danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 20px; padding: 14px; border: 1px solid #f4dcdc; border-radius: 10px; background: #fdf7f7; }
+.danger-zone h3 { margin: 0 0 4px; color: #a8454b; font-size: 10px; font-weight: 600; }
+.danger-zone p { margin: 0; color: #9c8b91; font-size: 9px; line-height: 1.6; }
+.danger-button { display: inline-flex; min-height: 34px; align-items: center; gap: 7px; padding: 0 13px; border: 1px solid #f0cfcf; border-radius: 8px; background: #fff; color: #b8484f; cursor: pointer; font-size: 10px; font-weight: 600; }
+.danger-button:hover { background: #fdf1f1; }
+.danger-button .icon { width: 13px; height: 13px; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+@media (max-width: 1000px) {
+  .team-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  .auth-card { padding: 22px; }
+  .auth-card h1 { font-size: 21px; }
+  .danger-zone { flex-direction: column; align-items: stretch; }
+}
