@@ -152,13 +152,23 @@ export const isSecureRequest = (req) => {
 };
 
 /**
- * Cookie-authenticated writes must come from our own origin. A browser sends
- * `Origin` on every non-GET request; if it does not match the host, the request
- * was made from somewhere else with our cookie attached.
+ * Cookie-authenticated writes must come from our own origin.
+ *
+ * `Sec-Fetch-Site` is the strongest signal available: the browser sets it, page
+ * JavaScript cannot forge it, and — unlike the Host header — it survives a
+ * reverse proxy that rewrites `Host` to an internal address (which is exactly
+ * what a hosted preview does, and why comparing hosts alone broke there).
+ *
+ * When a browser does not send it (very old, or a script), fall back to the
+ * classic check: the `Origin`/`Referer` host must equal `Host`. A request with
+ * no origin information at all came from a non-browser client, which cannot
+ * carry someone's ambient cookie, so it is allowed.
  */
 export function sameOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || site === 'none';
   const origin = req.headers.origin || req.headers.referer;
-  if (!origin) return true; // non-browser client (curl, tests) — no ambient cookie
+  if (!origin) return true;
   try {
     const host = String(req.headers.host || '');
     return new URL(origin).host === host;

@@ -134,7 +134,7 @@ themselves — which is what makes "exactly one owner" true rather than aspirati
 | Sessions | 32 random bytes, base64url in the cookie; only its SHA-256 digest is stored, so a database copy cannot be replayed |
 | Cookie | `studio_session`, `HttpOnly`, `SameSite=Lax`, `Secure` when `x-forwarded-proto: https`; 30-day sliding expiry |
 | Scripts | The same token is accepted as `Authorization: Bearer …` |
-| CSRF | Any cookie-authenticated write must be same-origin (missing `Origin`/`Referer` is treated as a non-browser client, which cannot send an ambient cookie) |
+| CSRF | Any cookie-authenticated write must be same-origin. The browser's `Sec-Fetch-Site` header is the primary signal — page JavaScript cannot forge it and it survives a proxy that rewrites `Host`; `Origin`/`Referer` against `Host` is the fallback, and a request with neither came from a non-browser client that cannot carry an ambient cookie |
 | Throttling | Sign-in and sign-up are limited per `email|ip` in memory (10 per 15 minutes by default) |
 | Enumeration | A wrong password and an unknown email return the identical 401 body |
 | Password change | Every session for that user is deleted, then the caller signs in again |

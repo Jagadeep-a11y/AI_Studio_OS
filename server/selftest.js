@@ -494,6 +494,12 @@ try {
   check('Cross-origin cookie writes are refused', crossOrigin.status === 403 && crossOrigin.body?.error?.code === 'cross_origin');
   const sameOrigin = await owner.post('/api/projects', { title: 'legit' }, { originHeader: base });
   check('Same-origin writes still work', sameOrigin.status === 201);
+  // A hosted preview sits behind a proxy that rewrites Host, so the browser's
+  // own same-origin signal has to be enough to allow the write.
+  const behindProxy = await owner.post('/api/projects', { title: 'behind a proxy' }, { headers: { 'Sec-Fetch-Site': 'same-origin', Origin: 'https://studio.preview.example' } });
+  check('A proxy that rewrites Host does not break same-origin writes', behindProxy.status === 201, `got ${behindProxy.status}`);
+  const crossSiteFetch = await owner.post('/api/projects', { title: 'nope' }, { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+  check('A cross-site fetch is refused even without an Origin header', crossSiteFetch.status === 403 && crossSiteFetch.body?.error?.code === 'cross_origin');
   const cookieValue = owner.jar.get('studio_session') || '';
   const storedSessions = new DatabaseSync(dbPath).prepare('SELECT id FROM sessions').all().map((row) => row.id);
   check('Only the token digest is stored, never the token', !storedSessions.includes(cookieValue) && storedSessions.length > 0);

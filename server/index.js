@@ -1061,7 +1061,9 @@ const server = http.createServer(async (req, res) => {
    * `Access-Control-Allow-Origin`, no credential sharing, nothing for another
    * site to call with the user's session attached.
    */
-  res.setHeader('Access-Control-Allow-Origin', 'same-origin');
+  // No Access-Control-Allow-Origin is ever sent: the API is same-origin by
+  // design now that it authenticates with a cookie, so there is nothing for
+  // another site to call — with or without the user's session attached.
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Vary', 'Origin');

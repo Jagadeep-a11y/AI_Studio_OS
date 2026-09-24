@@ -272,7 +272,9 @@ pressing Run never causes a duplicate run minutes later.
   collection, so the UI can update without a follow-up read.
 - `DELETE /api/projects/:id` archives: usage history and generations stay intact.
 - Request bodies are capped at 1 MB; malformed JSON returns `400 invalid_json`.
-- `OPTIONS` is answered for every route; `Access-Control-Allow-Origin` echoes the request origin.
+- `OPTIONS` is answered for every route, but no `Access-Control-Allow-Origin` is ever sent: with
+  cookie sessions the API is same-origin only, and a browser will not expose a cross-origin
+  response to a page that has no business reading it.
 - `AI_STUDIO_QUIET=1` disables the access log for cleaner test output.
 - Uploads are capped at 8 files × 10 MB per request; larger bodies are rejected with `413` before
   anything is written to disk.
