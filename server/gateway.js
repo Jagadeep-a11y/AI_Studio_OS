@@ -1,4 +1,5 @@
 import { CATALOG, approximateTokens, estimateCostUsd, estimateCredits, toPublicModel } from './catalog.js';
+import { imageAttachments, withTextReferences } from './files.js';
 import { createProviders } from './providers/index.js';
 import { ProviderError } from './providers/util.js';
 import { providerSummary } from './config.js';
@@ -159,10 +160,15 @@ export function createGateway(config) {
    * Streams a generation, normalising every provider's output into the same
    * event sequence the browser consumes.
    */
-  async function* run({ selection, prompt, mode = 'Writing', system = '', maxTokens = 1200, signal, kind }) {
+  async function* run({ selection, prompt, mode = 'Writing', system = '', maxTokens = 1200, signal, kind, attachments = [] }) {
     const outputKind = kind || kindForMode(mode);
     const { entry, provider, isDemoFallback } = resolve(selection, outputKind);
     if (!provider) throw new ProviderError('No provider available for this request', { code: 'no_provider' });
+
+    // Documents become prompt context; images are handed to the adapter.
+    const images = outputKind === 'image' ? [] : imageAttachments(attachments);
+    const promptWithReferences = withTextReferences(prompt, attachments);
+    const references = attachments.map((item) => ({ id: item.id, name: item.name, kind: item.kind, bytes: item.bytes }));
 
     yield {
       type: 'start',
@@ -177,7 +183,20 @@ export function createGateway(config) {
       pricing: entry.pricing || null,
       pricingEstimated: Boolean(entry.pricing?.estimated),
       note: entry.descriptionNote || '',
+      references,
+      imagesSent: images.length,
     };
+
+    const binaryReferences = attachments.filter((item) => item.kind === 'binary' || (item.kind === 'image' && !images.includes(item)));
+    if (binaryReferences.length && !provider.isDemo) {
+      yield {
+        type: 'notice',
+        message: `${binaryReferences.map((item) => item.name).join(', ')} ${binaryReferences.length === 1 ? 'was' : 'were'} attached but not sent: ${provider.label} only receives text and images in this build.`,
+      };
+    }
+    if (images.length && outputKind === 'image' && !provider.isDemo) {
+      yield { type: 'notice', message: 'Reference images are noted in the prompt; image-to-image is not wired up for this provider yet.' };
+    }
 
     if (entry.isDemo || provider.isDemo) {
       yield { type: 'notice', message: 'Demo output: generated locally by the Studio demo engine, not by an AI model.' };
@@ -200,7 +219,7 @@ export function createGateway(config) {
             hint: 'Choose an image-capable model such as GPT Image or Gemini Image.',
           });
         }
-        const result = await provider.generateImage({ model: entry.providerModel, prompt, signal });
+        const result = await provider.generateImage({ model: entry.providerModel, prompt: promptWithReferences, signal });
         assetUrl = result.dataUrl;
         tokensIn = result.tokensIn || approximateTokens(prompt);
         tokensOut = result.tokensOut || 0;
@@ -208,7 +227,7 @@ export function createGateway(config) {
       } else {
         // `runText` never exists alongside the generator: adapters expose one
         // streaming method so partial output is always visible to the user.
-        for await (const event of provider.streamText({ model: entry.providerModel, prompt, system, maxTokens, signal })) {
+        for await (const event of provider.streamText({ model: entry.providerModel, prompt: promptWithReferences, system, maxTokens, signal, images })) {
           if (event.type === 'delta') text += event.text;
           if (event.type === 'usage') {
             usageReported = true;

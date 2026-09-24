@@ -66,8 +66,11 @@ export function createMockProvider() {
       ];
     },
 
-    async *streamText({ prompt, kind = 'text', mode = 'Writing', signal }) {
+    async *streamText({ prompt, kind = 'text', mode = 'Writing', signal, images = [] }) {
       yield { type: 'notice', message: 'Demo output from the local Studio engine — no external model was called.' };
+      if (images.length) {
+        yield { type: 'notice', message: `${images.length} reference image${images.length === 1 ? '' : 's'} received. A real model would look at them; the demo engine only notes that they arrived.` };
+      }
 
       const opener = OPENERS[Math.abs(prompt.length + mode.length) % OPENERS.length];
       const lines = [opener, '', ...sectionsFor(kind, mode, prompt)];

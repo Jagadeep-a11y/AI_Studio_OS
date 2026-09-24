@@ -76,7 +76,9 @@ export function createYourVendorProvider(cfg) {
 
     // Must be an async generator that yields { type: 'delta', text } and,
     // at the end, { type: 'usage', tokensIn, tokensOut }.
-    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal }) {
+    // `images` is an array of { mime, dataUrl } reference images; adapters that
+    // cannot accept them should yield a notice saying so, never silently drop them.
+    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal, images = [] }) {
       if (!cfg.apiKey) throw notConfigured(id, this.hint);
       const response = await request(`${cfg.baseUrl}/chat`, {
         provider: id, method: 'POST', signal,
@@ -119,6 +121,7 @@ and the demo fallback come from the existing pipeline.
 | `discoverModels()` | ✅ | `[{ id, kind }]`; may throw — failures are recorded, never fatal |
 | `streamText()` | ✅ for text | Async generator of `delta`/`usage` events |
 | `generateImage()` | for images | Returns `{ dataUrl, revisedPrompt }` |
+| `streamText({ images })` | for vision | Reference images as `{ mime, dataUrl }`; yield a `notice` instead of dropping them |
 | `checkHealth()` | optional | Powers the "test" button in Settings → Connections |
 
 Event types an adapter may yield: `delta`, `usage`, `notice`. The gateway adds `start`, `asset`,
@@ -139,13 +142,16 @@ Event types an adapter may yield: `delta`, `usage`, `notice`. The gateway adds `
 
 ## Providers in this build
 
-| Provider | Auth | Text | Image | Discovery | Notes |
-| --- | --- | --- | --- | --- | --- |
-| OpenAI | `OPENAI_API_KEY` | ✅ `/chat/completions` (SSE) | ✅ `/images/generations` | ✅ `/models` | `OPENAI_BASE_URL` also covers OpenAI-compatible gateways |
-| Anthropic | `ANTHROPIC_API_KEY` | ✅ `/messages` (SSE) | — | ✅ `/models` | `ANTHROPIC_VERSION` is configurable |
-| Google Gemini | `GEMINI_API_KEY` | ✅ `streamGenerateContent` (SSE) | ✅ inline image parts | ✅ `/models` | `GOOGLE_API_KEY` also accepted |
-| Ollama | none (`OLLAMA_ENABLED=1`) | ✅ `/api/chat` (NDJSON) | — | ✅ `/api/tags` | Long timeout; models come from your machine |
-| Studio demo engine | none | ✅ local | ✅ SVG placeholder | n/a | Clearly labelled everywhere; disable with `AI_STUDIO_ALLOW_MOCK=0` |
+| Provider | Auth | Text | Image | Vision (uploads) | Discovery | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | ✅ `/chat/completions` (SSE) | ✅ `/images/generations` | ✅ `image_url` content parts | ✅ `/models` | `OPENAI_BASE_URL` also covers OpenAI-compatible gateways |
+| Anthropic | `ANTHROPIC_API_KEY` | ✅ `/messages` (SSE) | — | ✅ base64 image blocks | ✅ `/models` | `ANTHROPIC_VERSION` is configurable |
+| Google Gemini | `GEMINI_API_KEY` | ✅ `streamGenerateContent` (SSE) | ✅ inline image parts | ✅ `inline_data` parts | ✅ `/models` | `GOOGLE_API_KEY` also accepted |
+| Ollama | none (`OLLAMA_ENABLED=1`) | ✅ `/api/chat` (NDJSON) | — | ✅ `images` array | ✅ `/api/tags` | Long timeout; models come from your machine |
+| Studio demo engine | none | ✅ local | ✅ SVG placeholder | ✅ counted, then noted in the output | n/a | Clearly labelled everywhere; disable with `AI_STUDIO_ALLOW_MOCK=0` |
+
+Attached **text** files do not depend on a provider capability: the server appends them to the
+prompt as reference material under a heading, and the run records what travelled with it.
 
 Video and audio generation have no adapter yet. Those modes currently resolve to text or image
 output respectively, and the UI says so rather than implying a capability that does not exist.

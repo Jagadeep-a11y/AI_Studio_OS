@@ -14,12 +14,16 @@ plain Node with the built-in SQLite driver.
 ┌───────────────────────────────▼─────────────────────────────────────┐
 │  server/index.js    static files · JSON API · SSE generation stream │
 │  server/gateway.js  model resolution · streaming · credits          │
+│  server/scheduler.js  claim-then-run clock for due workflows        │
+│  server/automations.js  one executor for manual/scheduled/event runs │
+│  server/files.js    uploads, disk storage, attachment prep          │
+│  server/schedule.js schedule shapes · timezone math · next run      │
 │  server/store.js    data access (all SQL)                           │
 │  server/db.js       schema · seeding · row shaping                  │
 │  server/providers/  openai · anthropic · gemini · ollama · mock     │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
-                    data/studio.db (SQLite, WAL)
+                data/studio.db (SQLite, WAL) + data/uploads/
 ```
 
 ## Why one process
@@ -63,7 +67,7 @@ An adapter is a plain object with a small interface:
   id, label,
   isConfigured(): boolean,
   discoverModels({ signal }): Promise<Array<{ id, kind }>>,
-  streamText({ model, prompt, system, maxTokens, signal }): AsyncGenerator<Event>,
+  streamText({ model, prompt, system, maxTokens, signal, images }): AsyncGenerator<Event>,
   generateImage?({ model, prompt, signal }): Promise<{ dataUrl, revisedPrompt }>,
   checkHealth?({ signal }): Promise<{ ok, detail }>,
 }
@@ -78,10 +82,11 @@ nothing else. `docs/PROVIDERS.md` walks through adding one.
 
 | Event | Payload | Meaning |
 | --- | --- | --- |
-| `meta` | `generationId`, `projectId`, `projectTitle` | Sent before any provider work; the run is already addressable |
+| `meta` | `generationId`, `projectId`, `projectTitle`, `references` | Sent before any provider work; the run is already addressable |
+| `references` | `references`, `imagesSent` | Which uploaded files are travelling with this prompt, and how many go as vision input |
 | `start` | provider, model, kind, pricing flags, `isDemo` | Which model is answering, and whether it is real |
 | `delta` | `text` | A chunk of output; appended verbatim |
-| `asset` | `url`, `revisedPrompt` | An image (data URL), for image kinds |
+| `asset` | `url`, `revisedPrompt` | An image as it streams (data URL), for image kinds |
 | `notice` | `message` | Non-fatal information (demo output, estimated usage, early stop) |
 | `usage` | `tokensIn`, `tokensOut`, `estimated` | Token accounting |
 | `error` | `message`, `hint`, `code` | A failure the user can act on |
@@ -98,6 +103,7 @@ applies them directly rather than firing three more requests and risking a stale
 
 ```
 projects ──┬── generations (project_id, ON DELETE SET NULL)
+           ├── files (project_id)  ◄── bytes live in data/uploads/
            │
 automations ──┬── automation_runs ──► generations (generation_id)
               │
@@ -108,12 +114,55 @@ prompts      settings (key/value)      activity (feed)
 - **generations** — the unit of truth for usage: provider, model id and label, kind, mode, prompt,
   output text, optional asset, status, error, tokens, credits, cost, latency, timestamps.
 - **prompts** — the library, with real use counts.
-- **automations / automation_runs** — workflows and their run history, linked to the generation a
-  run produced.
+- **automations / automation_runs** — workflows with a structured `schedule` (JSON), the `next_run_at`
+  the scheduler claims, and a run history linked to the generation each run produced.
+- **files** — uploads and generated assets: name, mime, size, kind (`attachment` / `output`), the
+  stored filename, a text excerpt for prompt use, and the project/generation they belong to.
 - **settings** — workspace, profile, timezone; a key/value table so new preferences need no migration.
 - **activity** — the dashboard feed, written whenever something meaningful happens.
 
 Archiving a project sets a flag rather than deleting rows, so usage history stays intact.
+
+## The scheduler
+
+`server/schedule.js` is pure math: it turns a schedule object plus a timezone into the next UTC
+instant, and never returns a moment in the past. Timezone handling goes through `Intl`, so DST is
+the platform's problem rather than a table of offsets we would get wrong.
+
+`server/scheduler.js` is one unref'd timer with a three-step contract:
+
+1. **Find** automations whose `next_run_at` has passed (`store.dueAutomations`).
+2. **Claim** — move `next_run_at` forward *before* running. A crash mid-run, a slow provider, or a
+   second tick cannot double-fire the same window.
+3. **Run** through `automations.execute()` — the same function behind the Run-now button — then set
+   the next occurrence relative to the finish time.
+
+Two policies are deliberate and documented in the code:
+
+- **No backfill.** A server that was offline runs a due workflow once, not once per missed window.
+- **Back off on failure.** A failed run schedules its next attempt one backoff window out instead
+  of retrying immediately, so a broken provider cannot become a tight loop.
+
+Event triggers take the same path. A `PATCH /api/projects/:id` that changes a status looks up the
+automations watching that value and runs them in the background, so the HTTP response is not held
+open by a model call. The run history records its source (`manual`, `scheduled`, `event`), which is
+why the same executor exists in one place.
+
+## Files and attachments
+
+Uploads arrive as multipart, are validated against an allowlist and a size cap, and are written to
+`data/uploads/` beside the database. `server/files.js` owns the disk side; `store` owns the rows;
+both are keyed by the same file id, so a row without bytes is detectable (`file_missing`) rather
+than silently serving an empty image.
+
+Attachments reach a prompt in two shapes, because models accept them that way: images become vision
+input for the provider adapter, and text documents are appended under a "Reference material"
+heading. The gateway reports what it sent back to the client in the `references` event, so the UI
+can show the user exactly which files the model saw.
+
+Generated images are persisted the same way: the provider returns a data URL, the server writes it
+as a file, and the generation row stores the URL. Rows stay small, the browser can cache assets,
+and the same `GET /api/files/:id` route serves uploads and outputs.
 
 ## Frontend design
 
@@ -141,6 +190,11 @@ carries a demo notice when the demo engine wrote it.
 - `SIGINT`/`SIGTERM` close the server, then the database. `AI_STUDIO_QUIET=1` silences the access log.
 - Static serving refuses to hand out `.env`, anything under `server/`, or anything under `data/`,
   and blocks path traversal outside the repository root.
+- Uploads and generated assets live in `data/uploads/` (`AI_STUDIO_UPLOADS` overrides); with an
+  in-memory database the file store falls back to a temporary directory so a test run leaves no
+  traces behind.
+- The scheduler starts with the server and shuts down with it: the timer is `unref`'d, so it never
+  keeps the process alive on its own.
 
 ## Testing
 
@@ -148,15 +202,19 @@ Two layers, both running the real code rather than mocks:
 
 - **`npm test`** (`server/selftest.js`) boots an actual server process against a temporary SQLite
   file with every provider key blanked, then drives the API the way a browser does — including
-  reading a complete SSE stream and asserting the generation row, credits, project output count,
+  reading complete SSE streams and asserting the generation rows, credits, project output count,
   and usage aggregates that result. It also covers static serving, secret-exposure checks,
-  archiving, duplication, prompt counters, automation runs, and error paths (missing prompt,
-  malformed JSON, unconfigured provider, 404s).
+  archiving, duplication, prompt counters, automation runs, error paths (missing prompt, malformed
+  JSON, unconfigured provider, 404s), multipart uploads, attachments reaching the prompt, generated
+  assets landing on disk, an event trigger firing from a status change, and a scheduled workflow
+  running on its own — the test boots the scheduler with a fast tick so the real timer is exercised.
 - **`node tools/frontend-smoke.mjs`** loads `index.html` into a headless DOM (jsdom, installed with
   `--no-save` so it never becomes a runtime dependency) with `fetch` pointed at a running server,
   and drives the real UI: page navigation, catalogue filtering, the Connections tab, an image
-  generation and a writing generation with their streamed output and persisted history, prompt
-  saving, and the command palette. It fails on any uncaught error, unhandled rejection, or
+  generation and a writing generation with their streamed output and persisted history, attaching a
+  reference file and confirming the dialog reports it, reading run history on the automations page,
+  building a schedule through the modal, opening a project's stored files, saving a prompt, and
+  using the command palette. It fails on any uncaught error, unhandled rejection, or
   `console.error`.
 
 That combination is why a `const` reassigned inside the boot path — invisible to the API tests —

@@ -193,6 +193,8 @@
     popover: null,
     settingsTab: 'Profile',
     notificationsRead: false,
+    attachments: [],       // reference files waiting to be sent with a prompt
+    uploads: [],           // files stored on the server for this workspace
     models: null,          // live catalogue once the server answers
     usage: null,           // live usage summary
     generation: null,      // in-flight generation view state
@@ -228,6 +230,67 @@
 
   const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   const icon = (name, extraClass = '') => `<svg class="icon ${extraClass}" aria-hidden="true"><use href="#i-${escapeHTML(name)}"></use></svg>`;
+
+  /** Small preview chips for the files waiting to be sent with the next prompt. */
+  function attachmentStripHTML() {
+    if (!state.attachments.length) return '';
+    const chips = state.attachments.map((file) => `<span class="attachment-chip ${file.uploading ? 'is-uploading' : ''}" data-file-id="${escapeHTML(file.id || '')}">${icon(file.isImage ? 'image' : 'file', 'icon-small')}<span class="attachment-name">${escapeHTML(file.name)}</span><span class="attachment-size">${escapeHTML(humanSize(file.size))}</span>${file.uploading ? '' : `<button type="button" data-action="remove-attachment" data-id="${escapeHTML(file.id)}" aria-label="Remove ${escapeHTML(file.name)}">${icon('close', 'icon-small')}</button>`}</span>`).join('');
+    return `<div class="attachment-strip" aria-label="Attached reference files">${chips}</div>`;
+  }
+
+  function humanSize(bytes) {
+    const value = Number(bytes) || 0;
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${Math.round(value / 102.4) / 10} KB`;
+    return `${Math.round(value / (1024 * 102.4)) / 10} MB`;
+  }
+
+  /**
+   * Uploads the picked files, then re-renders only the attachment strip so the
+   * text the user has already typed is never disturbed.
+   */
+  async function uploadAttachments(fileList) {
+    const picked = Array.from(fileList || []).slice(0, 8);
+    if (!picked.length) return;
+    if (!api.online) {
+      showToast('Start the Studio server (npm start) to attach reference files.', 'error');
+      return;
+    }
+
+    const pending = picked.map((file) => ({ id: `pending-${Math.random().toString(36).slice(2, 8)}`, name: file.name, size: file.size, isImage: file.type.startsWith('image/'), uploading: true }));
+    state.attachments = [...state.attachments, ...pending];
+    refreshAttachmentStrip();
+
+    const form = new FormData();
+    for (const file of picked) form.append('files', file, file.name);
+    try {
+      const response = await fetch('/api/files', { method: 'POST', body: form });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error?.message || 'The upload failed.');
+      const uploadedIds = new Set(payload.files.map((file) => file.id));
+      state.attachments = state.attachments.filter((file) => !pending.some((item) => item.id === file.id)).concat(payload.files);
+      if (Array.isArray(payload.files)) state.uploads = [...payload.files, ...state.uploads];
+      showToast(`${payload.files.length} file${payload.files.length === 1 ? '' : 's'} attached.`);
+    } catch (error) {
+      state.attachments = state.attachments.filter((file) => !pending.some((item) => item.id === file.id));
+      showToast(error.message, 'error');
+    } finally {
+      refreshAttachmentStrip();
+      const input = document.getElementById('attachment-input');
+      if (input) input.value = '';
+    }
+  }
+
+  function refreshAttachmentStrip() {
+    const strip = document.querySelector('.attachment-strip');
+    if (strip) {
+      strip.outerHTML = attachmentStripHTML();
+      // An empty strip leaves nothing behind, so repaint the composer instead.
+      if (!state.attachments.length) renderPage();
+    } else if (state.attachments.length) {
+      renderPage();
+    }
+  }
   const currentPageName = () => pageNames[state.page] || 'Overview';
 
   function updateShell() {
@@ -298,6 +361,8 @@
     };
     content.innerHTML = (renderers[state.page] || renderDashboard)();
     updateShell();
+    if (state.page === 'automations') loadAutomationRuns();
+    if (state.page === 'settings' && state.settingsTab === 'Connections') loadWorkspaceFiles();
   }
 
   function getArtMarkup(project) {
@@ -361,11 +426,14 @@
       <form class="prompt-box" id="prompt-form">
         <label class="sr-only" for="main-prompt">Describe what you want to create</label>
         <textarea id="main-prompt" name="prompt" rows="2" placeholder="Describe an idea, paste a brief, or drop a task to get started..."></textarea>
+        ${attachmentStripHTML()}
         <div class="prompt-footer">
           <div class="prompt-tools">
             <button class="prompt-tool" type="button" data-action="choose-mode" aria-label="Choose creation type">${icon(modeIcon(state.promptMode))}<span id="selected-mode">${escapeHTML(state.promptMode)}</span>${icon('chevron-down', 'icon-small')}</button>
             <button class="prompt-tool model-tool" type="button" data-action="choose-model" aria-label="Choose an AI model">${icon('sliders')}<span id="selected-model">${escapeHTML(state.selectedModel)}</span>${icon('chevron-down', 'icon-small')}</button>
+            <button class="prompt-tool" type="button" data-action="attach-files" aria-label="Attach reference files">${icon('paperclip')}<span>Attach</span>${state.attachments.length ? `<span class="prompt-tool-count">${state.attachments.length}</span>` : ''}</button>
             <button class="prompt-tool prompt-enhance" type="button" data-action="enhance-prompt">${icon('wand')}<span>Polish</span></button>
+            <input type="file" id="attachment-input" class="sr-only" multiple accept="image/*,.pdf,.txt,.md,.csv,.json" />
           </div>
           <button class="prompt-submit" type="submit" aria-label="Start creating">${icon('arrow-right')}</button>
         </div>
@@ -500,11 +568,97 @@
     return `<div class="prompt-grid">${shown.map((prompt) => `<article class="prompt-card"><div class="prompt-card-head"><span class="prompt-card-icon">${icon(prompt.icon)}</span><div><h3>${escapeHTML(prompt.title)}</h3><span class="prompt-category">${escapeHTML(prompt.category)}</span></div></div><blockquote>${escapeHTML(prompt.text)}</blockquote><div class="prompt-card-footer"><span class="prompt-usage">${escapeHTML(formatUses(prompt.uses))}</span><button class="text-link" type="button" data-action="use-prompt" data-id="${escapeHTML(prompt.id)}">Use prompt ${icon('arrow-right')}</button></div></article>`).join('')}</div>`;
   }
 
+  /** File count + scheduler health, refreshed whenever Connections is opened. */
+  async function loadWorkspaceFiles() {
+    if (!api.online) return;
+    try {
+      const [filePayload, scheduler] = await Promise.all([
+        api.request('/api/files?limit=50'),
+        api.request('/api/scheduler'),
+      ]);
+      state.uploads = filePayload.files;
+      state.scheduler = scheduler;
+      if (state.page === 'settings') {
+        const content = document.getElementById('app-content');
+        if (content) content.innerHTML = renderSettingsPage();
+      }
+    } catch { /* settings still render without storage stats */ }
+  }
+
+  /**
+   * The bootstrap payload stays small, so run history is fetched when the
+
+   * automations page is actually opened. One in-flight request at a time.
+   */
+  async function loadAutomationRuns({ force = false } = {}) {
+    if (!api.online || state.automationRunsLoading) return;
+    // Rendering the page repeatedly must not turn into a request storm.
+    if (!force && state.automationRunsFetchedAt && Date.now() - state.automationRunsFetchedAt < 4000) return;
+    state.automationRunsLoading = true;
+    try {
+      const payload = await api.request('/api/automations?runs=1');
+      state.automations = payload.automations;
+      if (payload.stats) state.automationStats = payload.stats;
+      state.automationRunsFetchedAt = Date.now();
+      if (payload.scheduler) state.scheduler = payload.scheduler;
+      if (state.page === 'automations') {
+        const content = document.getElementById('app-content');
+        if (content) content.innerHTML = renderAutomationsPage();
+      }
+    } catch { /* the list is still usable without history */ } finally {
+      state.automationRunsLoading = false;
+    }
+  }
+
+  /** Turns the schedule builder's fields into the server's schedule shape. */
+  function scheduleFromForm(data) {
+    const kind = String(data.get('kind') || 'daily');
+    const time = String(data.get('time') || '09:00');
+    if (kind === 'weekly') return { type: 'daily', time, daysOfWeek: [Number(data.get('weekday'))] };
+    if (kind === 'monthly') return { type: 'monthly', day: Number(data.get('day')), time };
+    if (kind === 'interval') return { type: 'interval', everyMinutes: Number(data.get('everyMinutes')) };
+    if (kind === 'event') {
+      const [event, value] = String(data.get('event') || 'project.status:In review').split(':');
+      return { type: 'event', event, value };
+    }
+    if (kind === 'manual') return { type: 'manual' };
+    return { type: 'daily', time, daysOfWeek: [0, 1, 2, 3, 4, 5, 6] };
+  }
+
+  /** Shows only the fields the chosen schedule type needs. */
+  function syncScheduleFields(scope) {
+    const kind = scope.querySelector('[data-schedule-kind]')?.value;
+    for (const block of scope.querySelectorAll('[data-schedule-fields]')) {
+      block.hidden = !block.dataset.scheduleFields.split(' ').includes(kind);
+    }
+  }
+
+  /** Last few runs of a workflow, straight from the server's run history. */
+  function automationRunsHTML(automation) {
+    const runs = automation.runs || [];
+    if (!runs.length) return '';
+    return `<div class="automation-runs">${runs.map((run) => `<div class="automation-run"><span class="status-dot ${escapeHTML(run.status)}"></span><span>${escapeHTML(run.status === 'succeeded' ? 'Ran' : run.status === 'failed' ? 'Failed' : 'Skipped')} ${escapeHTML(run.createdLabel || '')}</span><span>${escapeHTML((run.note || '').slice(0, 54))}</span></div>`).join('')}</div>`;
+  }
+
+  function schedulerHeadline() {
+    const scheduler = state.scheduler;
+    if (!scheduler) return 'Unknown';
+    if (!scheduler.enabled) return 'Paused';
+    return scheduler.active ? 'Checking every ' + Math.round(scheduler.tickMs / 1000) + 's' : 'Stopped';
+  }
+
+  function schedulerDetail() {
+    const scheduler = state.scheduler;
+    if (!scheduler) return 'No scheduler status from the server yet.';
+    const runs = scheduler.counts?.runs || 0;
+    return `${runs} scheduled run${runs === 1 ? '' : 's'} · ${escapeHTML(scheduler.timeZone || 'UTC')}`;
+  }
+
   function renderAutomationsPage() {
     return `<section class="page-heading"><div><div class="eyebrow">Let the small things run themselves</div><h1>Automations</h1><p>Make repeatable creative work feel a little less repetitive.</p></div><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></section>
-      <section class="metrics-grid" aria-label="Automation summary"><article class="metric-card"><div class="metric-topline"><span>Active automations</span><span class="metric-icon">${icon('workflow')}</span></div><div class="metric-main"><strong class="metric-value">${state.automations.filter((automation) => automation.enabled).length}</strong><span class="metric-meta">out of ${state.automations.length} workflows</span></div></article><article class="metric-card"><div class="metric-topline"><span>Runs this month</span><span class="metric-icon green">${icon('refresh')}</span></div><div class="metric-main"><strong class="metric-value">42</strong><span class="metric-meta positive">↑ 12% this month</span></div></article><article class="metric-card"><div class="metric-topline"><span>Time returned</span><span class="metric-icon peach">${icon('clock')}</span></div><div class="metric-main"><strong class="metric-value">3.6 hrs</strong><span class="metric-meta">back for the good work</span></div></article></section>
+      <section class="metrics-grid" aria-label="Automation summary"><article class="metric-card"><div class="metric-topline"><span>Active automations</span><span class="metric-icon">${icon('workflow')}</span></div><div class="metric-main"><strong class="metric-value">${state.automations.filter((automation) => automation.enabled).length}</strong><span class="metric-meta">out of ${state.automations.length} workflows</span></div></article><article class="metric-card"><div class="metric-topline"><span>Runs this month</span><span class="metric-icon green">${icon('refresh')}</span></div><div class="metric-main"><strong class="metric-value">${escapeHTML(String(state.automationStats?.recent ?? 0))}</strong><span class="metric-meta">${escapeHTML(state.automationStats?.total ? `${state.automationStats.total} recorded in total` : 'no runs recorded yet')}</span></div></article><article class="metric-card"><div class="metric-topline"><span>The scheduler</span><span class="metric-icon peach">${icon('clock')}</span></div><div class="metric-main"><strong class="metric-value">${escapeHTML(schedulerHeadline())}</strong><span class="metric-meta">${escapeHTML(schedulerDetail())}</span></div></article></section>
       <div class="section-head"><div><h2>Your workflows</h2><p class="section-subtitle">Pause, run, or refine a workflow any time.</p></div><button class="text-link" type="button" data-action="automation-templates">Browse templates ${icon('arrow-right')}</button></div>
-      <div class="automation-list">${state.automations.map((automation) => `<article class="automation-row"><span class="automation-icon ${escapeHTML(automation.tone || '')}">${icon('workflow')}</span><div class="automation-main"><h3>${escapeHTML(automation.name)}</h3><p>${escapeHTML(automation.description)}</p></div><span class="automation-meta">${escapeHTML(automation.trigger)}</span><button type="button" class="quiet-button" data-action="run-automation" data-id="${escapeHTML(automation.id)}" aria-label="Run ${escapeHTML(automation.name)} now">${icon('play')}</button><button type="button" class="toggle" role="switch" aria-checked="${Boolean(automation.enabled)}" aria-label="${automation.enabled ? 'Pause' : 'Enable'} ${escapeHTML(automation.name)}" data-action="toggle-automation" data-id="${escapeHTML(automation.id)}"></button></article>`).join('') || `<div class="empty-state"><div><span class="empty-state-icon">${icon('workflow')}</span><h2>No workflows yet</h2><p>Create your first automation to take a repeatable task off your hands.</p><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></div></div>`}</div>`;
+      <div class="automation-list">${state.automations.map((automation) => `<article class="automation-row"><span class="automation-icon ${escapeHTML(automation.tone || '')}">${icon('workflow')}</span><div class="automation-main"><h3>${escapeHTML(automation.name)}</h3><p>${escapeHTML(automation.description)}</p>${automationRunsHTML(automation)}</div><span class="automation-meta">${escapeHTML(automation.trigger || automation.triggerLabel || 'On demand')}${automation.nextRunLabel ? `<span class="automation-schedule">Next run ${escapeHTML(automation.nextRunLabel)}</span>` : (automation.schedule?.type === 'event' ? '<span class="automation-schedule">Runs when the event fires</span>' : '')}</span><button type="button" class="quiet-button" data-action="run-automation" data-id="${escapeHTML(automation.id)}" aria-label="Run ${escapeHTML(automation.name)} now">${icon('play')}</button><button type="button" class="toggle" role="switch" aria-checked="${Boolean(automation.enabled)}" aria-label="${automation.enabled ? 'Pause' : 'Enable'} ${escapeHTML(automation.name)}" data-action="toggle-automation" data-id="${escapeHTML(automation.id)}"></button></article>`).join('') || `<div class="empty-state"><div><span class="empty-state-icon">${icon('workflow')}</span><h2>No workflows yet</h2><p>Create your first automation to take a repeatable task off your hands.</p><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></div></div>`}</div>`;
   }
 
   /**
@@ -558,7 +712,12 @@
       fields = `<div class="form-field"><label for="settings-timezone">Time zone</label><select id="settings-timezone" name="timezone"><option ${state.settings.timezone === 'Asia/Kolkata' ? 'selected' : ''}>Asia/Kolkata</option><option>America/Los_Angeles</option><option>Europe/London</option><option>UTC</option></select></div><div class="form-field"><label for="settings-start-page">Start page</label><select id="settings-start-page"><option>Overview</option><option>Projects</option><option>Canvas</option></select></div><p class="section-subtitle">Keyboard shortcut: press Ctrl / ⌘ + K to search, create, or jump anywhere.</p>`;
     }
     const iconFor = (tab) => ({ Profile: 'file', Workspace: 'folder', Preferences: 'settings', Connections: 'lightning' }[tab]);
-    const connectionPanel = `<h2>Generation connections</h2><p>Keys are read from <code>.env</code> on the server. This page never sees them.</p>${api.online ? `<div class="provider-list" style="margin-top:14px">${providerRowsHTML({ showProbe: true })}</div><div style="margin-top:14px">${nextStepHTML()}</div>` : `<div class="output-notice" style="margin-top:14px">${icon('close')}<div>The Studio server is not reachable, so no connections can be inspected. Run <code>npm start</code> and reconnect.</div></div><button class="secondary-button" type="button" data-action="reconnect-backend" style="margin-top:12px">${icon('refresh')} Reconnect</button>`}`;
+    const connectionPanel = `<h2>Generation connections</h2><p>Keys are read from <code>.env</code> on the server. This page never sees them.</p>${api.online ? `<div class="provider-list" style="margin-top:14px">${providerRowsHTML({ showProbe: true })}</div><div style="margin-top:14px">${nextStepHTML()}</div>` : `<div class="output-notice" style="margin-top:14px">${icon('close')}<div>The Studio server is not reachable, so no connections can be inspected. Run <code>npm start</code> and reconnect.</div></div><button class="secondary-button" type="button" data-action="reconnect-backend" style="margin-top:12px">${icon('refresh')} Reconnect</button>`}
+    ${api.online ? `<h2 style="margin-top:18px">Automation scheduler</h2>
+      <div class="scheduler-note">${icon('clock')}<span>${escapeHTML(schedulerHeadline())} · ${escapeHTML(schedulerDetail())}</span></div>
+      <p>Due workflows are claimed by the server before they run, so a restart never double-fires one. A window missed while the server was off runs once on the next check — never a backlog.</p>
+      <p>Storage: ${(state.uploads || []).length} file${(state.uploads || []).length === 1 ? '' : 's'} on disk in <code>data/uploads</code>. Generated images are saved as files instead of data URLs inside the database.</p>` : ''};`
+
     return `<section class="page-heading"><div><div class="eyebrow">Make the studio yours</div><h1>Settings</h1><p>Manage your profile and the way your workspace feels.</p></div></section><div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections">${tabs.map((tab) => `<button type="button" class="${state.settingsTab === tab ? 'is-active' : ''}" data-action="settings-tab" data-tab="${escapeHTML(tab)}">${icon(iconFor(tab))}${escapeHTML(tab)}</button>`).join('')}</nav><section class="settings-card">${state.settingsTab === 'Connections'
       ? connectionPanel
       : `<h2>${escapeHTML(state.settingsTab)} settings</h2><p>Only you can see and manage these details.</p><form id="settings-form">${fields}<div class="modal-footer" style="padding:13px 0 0;margin-top:5px"><span class="modal-note">${api.online ? 'Saved to your workspace database.' : 'Changes save to this browser.'}</span><button class="primary-button" type="submit">Save changes</button></div></form>`}</section></div>`;
@@ -596,8 +755,28 @@
     if (!project) return showToast('That project is no longer here.', 'error');
     const cover = getArtMarkup(project);
     const prompt = project.prompt || 'Add a short brief to give this project a clear starting point.';
-    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog modal-wide" role="dialog" aria-modal="true" aria-labelledby="project-detail-title"><div class="modal-header"><div><h2 id="project-detail-title">${escapeHTML(project.title)}</h2><p>Project overview · Updated ${escapeHTML(project.updated || 'just now')}</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><div class="project-detail-cover">${cover}</div><div class="modal-body"><div class="detail-tags"><span class="detail-tag">${escapeHTML(project.type)}</span><span class="detail-tag">${escapeHTML(project.model || 'Auto select')}</span><span class="detail-tag">${escapeHTML(project.status || 'Draft')}</span></div><div class="detail-stats"><div class="detail-stat"><strong>${escapeHTML(project.outputs ?? 0)}</strong><span>outputs created</span></div><div class="detail-stat"><strong>${escapeHTML(project.model || 'Auto select')}</strong><span>primary model</span></div><div class="detail-stat"><strong>${escapeHTML(project.updated || 'Just now')}</strong><span>last activity</span></div></div><p class="detail-section-label">Project brief</p><p class="detail-prompt">${escapeHTML(prompt)}</p><div id="project-generations"></div></div><div class="modal-footer"><span class="modal-note">A good project can change shape as you work.</span><button class="secondary-button" type="button" data-action="duplicate-project" data-id="${escapeHTML(project.id)}">${icon('copy')} Duplicate</button><button class="secondary-button" type="button" data-action="generate-again" data-id="${escapeHTML(project.id)}">${icon('wand')} Generate</button><button class="primary-button" type="button" data-action="detail-open-canvas" data-id="${escapeHTML(project.id)}">Open in canvas ${icon('arrow-right')}</button></div></section></div>`, 'project-detail', { focus: '.modal-close' });
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog modal-wide" role="dialog" aria-modal="true" aria-labelledby="project-detail-title"><div class="modal-header"><div><h2 id="project-detail-title">${escapeHTML(project.title)}</h2><p>Project overview · Updated ${escapeHTML(project.updated || 'just now')}</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><div class="project-detail-cover">${cover}</div><div class="modal-body"><div class="detail-tags"><span class="detail-tag">${escapeHTML(project.type)}</span><span class="detail-tag">${escapeHTML(project.model || 'Auto select')}</span><span class="detail-tag">${escapeHTML(project.status || 'Draft')}</span></div><div class="detail-stats"><div class="detail-stat"><strong>${escapeHTML(project.outputs ?? 0)}</strong><span>outputs created</span></div><div class="detail-stat"><strong>${escapeHTML(project.model || 'Auto select')}</strong><span>primary model</span></div><div class="detail-stat"><strong>${escapeHTML(project.updated || 'Just now')}</strong><span>last activity</span></div></div><p class="detail-section-label">Project brief</p><p class="detail-prompt">${escapeHTML(prompt)}</p><div id="project-files"></div><div id="project-generations"></div></div><div class="modal-footer"><span class="modal-note">A good project can change shape as you work.</span><button class="secondary-button" type="button" data-action="duplicate-project" data-id="${escapeHTML(project.id)}">${icon('copy')} Duplicate</button><button class="secondary-button" type="button" data-action="generate-again" data-id="${escapeHTML(project.id)}">${icon('wand')} Generate</button><button class="primary-button" type="button" data-action="detail-open-canvas" data-id="${escapeHTML(project.id)}">Open in canvas ${icon('arrow-right')}</button></div></section></div>`, 'project-detail', { focus: '.modal-close' });
     loadProjectGenerations(project.id);
+    loadProjectFiles(project.id);
+  }
+
+  /**
+   * Reference material and generated assets that belong to a project. Bytes
+   * live on the server; this only ever renders URLs.
+   */
+  async function loadProjectFiles(projectId) {
+    if (!api.online) return;
+    const slot = document.getElementById('project-files');
+    if (!slot) return;
+    try {
+      const { files } = await api.request(`/api/projects/${encodeURIComponent(projectId)}/files`);
+      const slotNow = document.getElementById('project-files');
+      if (!slotNow || !files?.length) return;
+      const attachments = files.filter((file) => file.kind === 'attachment');
+      const outputs = files.filter((file) => file.kind !== 'attachment');
+      const tile = (file) => `<figure class="file-tile"><a href="${escapeHTML(file.url)}" target="_blank" rel="noopener">${file.isImage ? `<img src="${escapeHTML(file.url)}" alt="${escapeHTML(file.name)}">` : `<div style="height:92px;display:grid;place-items:center;background:#f4f2ee">${icon('file')}</div>`}</a><figcaption class="file-tile-body"><strong title="${escapeHTML(file.name)}">${escapeHTML(file.name)}</strong><span>${escapeHTML(humanSize(file.size))}</span></figcaption></figure>`;
+      slotNow.innerHTML = `${outputs.length ? `<p class="detail-section-label">Generated assets</p><div class="file-grid">${outputs.map(tile).join('')}</div>` : ''}${attachments.length ? `<p class="detail-section-label" style="margin-top:12px">Reference files</p><div class="file-grid">${attachments.map(tile).join('')}</div>` : ''}`;
+    } catch { /* files are a bonus; generations still render */ }
   }
 
   /** Real output history for a project, pulled from the database. */
@@ -823,7 +1002,14 @@
   }
 
   function openNewAutomationModal() {
-    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="automation-modal-title"><div class="modal-header"><div><h2 id="automation-modal-title">Create an automation</h2><p>Start with one small, repeatable thing.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="automation-form"><div class="modal-body"><div class="form-field"><label for="automation-name">Automation name</label><input id="automation-name" name="name" placeholder="e.g. Share a Friday round-up" required maxlength="60" /></div><div class="form-field"><label for="automation-trigger">When should it run?</label><select name="trigger" id="automation-trigger"><option>Every Monday · 9:00 AM</option><option>Every Friday · 3:00 PM</option><option>When a project is marked ready</option><option>On the first day of each month</option></select></div><div class="form-field"><label for="automation-action">What should it do?</label><select name="action" id="automation-action"><option>Curate & summarize</option><option>Draft a handoff</option><option>Organize projects</option><option>Prepare a creative brief</option></select></div><div class="form-field"><label for="automation-description">A note for future you <span style="color:#a6a4b0;font-weight:400">(optional)</span></label><textarea name="description" id="automation-description" placeholder="What should this workflow take care of?"></textarea></div></div><div class="modal-footer"><span class="modal-note">Automations are saved locally in this prototype.</span><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create automation ${icon('arrow-right')}</button></div></form></section></div>`, 'new-automation', { focus: '#automation-name' });
+    openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="automation-modal-title"><div class="modal-header"><div><h2 id="automation-modal-title">Create an automation</h2><p>Start with one small, repeatable thing.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="automation-form"><div class="modal-body"><div class="form-field"><label for="automation-name">Automation name</label><input id="automation-name" name="name" placeholder="e.g. Share a Friday round-up" required maxlength="60" /></div><div class="form-field"><label for="automation-kind">When should it run?</label><select name="kind" id="automation-kind" data-schedule-kind><option value="daily">Every day at a set time</option><option value="weekly">Every week on a set day</option><option value="monthly">Every month on a set date</option><option value="interval">On a repeating interval</option><option value="event">When something happens in the studio</option><option value="manual">Only when I press run</option></select>
+            <div class="schedule-fields" data-schedule-fields="daily weekly monthly"><label for="automation-time">Time of day</label><input type="time" id="automation-time" name="time" value="09:00" /></div>
+            <div class="schedule-fields" data-schedule-fields="weekly"><label for="automation-weekday">Day of week</label><select id="automation-weekday" name="weekday"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></div>
+            <div class="schedule-fields" data-schedule-fields="monthly"><label for="automation-day">Day of month</label><input type="number" id="automation-day" name="day" min="1" max="28" value="1" /></div>
+            <div class="schedule-fields" data-schedule-fields="interval"><label for="automation-every">Every (minutes)</label><input type="number" id="automation-every" name="everyMinutes" min="1" max="43200" value="60" /></div>
+            <div class="schedule-fields" data-schedule-fields="event"><label for="automation-event">Event</label><select id="automation-event" name="event"><option value="project.status:In review">A project is marked “In review”</option><option value="project.status:Published">A project is marked “Published”</option><option value="project.status:Complete">A project is marked “Complete”</option></select></div>
+            <span class="modal-note">Times use the workspace timezone (${escapeHTML(state.settings.timezone || 'UTC')}).</span></div><div class="form-field"><label for="automation-action">What should it do?</label><select name="action" id="automation-action"><option>Curate & summarize</option><option>Draft a handoff</option><option>Organize projects</option><option>Prepare a creative brief</option></select></div><div class="form-field"><label for="automation-description">A note for future you <span style="color:#a6a4b0;font-weight:400">(optional)</span></label><textarea name="description" id="automation-description" placeholder="What should this workflow take care of?"></textarea></div></div><div class="modal-footer"><span class="modal-note">Scheduled workflows run on the server, even when this tab is closed.</span><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create automation ${icon('arrow-right')}</button></div></form></section></div>`, 'new-automation', { focus: '#automation-name' });
+    syncScheduleFields(document);
   }
 
   // -------------------------------------------------------------------------
@@ -892,6 +1078,11 @@
 
   function finishOutput(view, payload) {
     const generation = payload?.generation || {};
+    // The stream shows the image as it arrives; once it is saved, the dialog
+    // shows the file the workspace actually keeps.
+    if (generation.assetUrl && !String(generation.assetUrl).startsWith('data:') && view.imageSlot) {
+      view.imageSlot.innerHTML = `<img class="output-image" alt="Generated output" src="${escapeHTML(generation.assetUrl)}">`;
+    }
     if (view.statusRow) view.statusRow.innerHTML = payload?.failed ? `${icon('close')}<span>Generation failed</span>` : `${icon('check')}<span>Saved to your project</span>`;
     if (view.stream) {
       view.stream.classList.remove('is-streaming');
@@ -924,7 +1115,7 @@
    * Runs a generation. Every event the server streams is reflected live, so the
    * user watches the model work rather than a spinner.
    */
-  async function startGeneration({ prompt, mode, model, projectId = null, title = '' }) {
+  async function startGeneration({ prompt, mode, model, projectId = null, title = '', fileIds = [] }) {
     if (!api.online) {
       // No server: the brief is still worth keeping, and the message says why
       // nothing was generated rather than failing silently.
@@ -951,7 +1142,15 @@
       await api.stream('/api/generate', {
         prompt, mode, model, projectId: projectId || undefined, title: title || undefined,
         type: projectTypeForMode(mode),
+        fileIds: fileIds.length ? fileIds : undefined,
       }, {
+        references: (event) => {
+          const files = event.references || [];
+          if (files.length) {
+            const images = event.imagesSent ? `, ${event.imagesSent} sent as vision input` : '';
+            pushNotice(view, `${files.length} reference file${files.length === 1 ? '' : 's'} attached (${files.map((file) => file.name).join(', ')})${images}.`);
+          }
+        },
         start: (event) => {
           if (view.subtitle) view.subtitle.textContent = `${event.modelLabel} · ${providerLabel(event.provider)}`;
           if (view.status) view.status.textContent = event.kind === 'image' ? 'Rendering an image…' : 'Streaming output…';
@@ -1004,6 +1203,8 @@
     }
     if (payload.usage) state.usage = payload.usage;
     if (Array.isArray(payload.automations)) state.automations = payload.automations;
+    if (Array.isArray(payload.files)) state.uploads = payload.files;
+    if (payload.scheduler) state.scheduler = payload.scheduler;
     updateShell();
   }
 
@@ -1144,6 +1345,8 @@
         return;
       }
       renderPage();
+      // The run response carries the list, not each workflow's history.
+      loadAutomationRuns({ force: true });
       showToast(`“${automation.name}” finished${payload.isDemo ? ' in demo mode' : ''}.`);
       const view = openGenerationModal({ prompt: '', mode: 'Writing', model: payload.generation?.model || 'Auto select' });
       view.text = payload.output || '';
@@ -1191,6 +1394,8 @@
         activity: data.activity,
         automations: data.automations,
         usage: data.usage,
+        files: data.files,
+        scheduler: data.scheduler,
       });
       state.models = data.models;
       state.settings = { ...state.settings, ...data.settings };
@@ -1248,7 +1453,6 @@
         showToast('Your idea has a little more structure.');
         break;
       }
-      case 'attach-file': showToast('File attachments can be connected when you add a storage service.'); break;
       case 'open-project': closePopover(); projectDetailModal(id); break;
       case 'project-menu': showProjectMenu(button, id); break;
       case 'duplicate-project': duplicateProject(id); break;
@@ -1308,6 +1512,14 @@
         break;
       }
       case 'save-prompt-info': savePromptModal(); break;
+      case 'attach-files': document.getElementById('attachment-input')?.click(); break;
+      case 'remove-attachment': {
+        const file = state.attachments.find((item) => item.id === id);
+        state.attachments = state.attachments.filter((item) => item.id !== id);
+        if (file && /^f-/.test(id)) api.request(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+        refreshAttachmentStrip();
+        break;
+      }
       case 'new-automation': openNewAutomationModal(); break;
       case 'toggle-automation': toggleAutomation(id); break;
       case 'run-automation': runAutomation(id); break;
@@ -1401,6 +1613,15 @@
     if (event.target.id === 'command-input') renderCommandResults(event.target.value);
   });
 
+  // File pickers and selects settle on `change`, not `input` — listening for
+  // both would upload the same file twice.
+  document.addEventListener('change', (event) => {
+    if (event.target.matches?.('[data-schedule-kind]')) syncScheduleFields(event.target.closest('form') || document);
+    if (event.target.id === 'attachment-input' && event.target.files?.length) {
+      uploadAttachments(event.target.files);
+    }
+  });
+
   document.addEventListener('submit', (event) => {
     if (event.target.id === 'prompt-form') {
       event.preventDefault();
@@ -1415,7 +1636,10 @@
       const fullTitle = title.length < prompt.length ? `${title}…` : title;
       // The dashboard prompt box generates straight away; the brief becomes the
       // project and the model's output lands inside it.
-      startGeneration({ prompt, mode: state.promptMode, model: state.selectedModel, title: fullTitle });
+      const fileIds = state.attachments.filter((file) => !file.uploading).map((file) => file.id);
+      startGeneration({ prompt, mode: state.promptMode, model: state.selectedModel, title: fullTitle, fileIds });
+      state.attachments = [];
+      refreshAttachmentStrip();
       return;
     }
     if (event.target.id === 'create-project-form') {
@@ -1424,6 +1648,26 @@
       const data = new FormData(form);
       const created = createProject({ title: data.get('title'), type: data.get('type'), model: data.get('model'), prompt: data.get('prompt') });
       if (created) closeModal(false);
+      return;
+    }
+    if (event.target.id === 'automation-form') {
+      event.preventDefault();
+      const data = new FormData(event.target);
+      const schedule = scheduleFromForm(data);
+      api.request('/api/automations', {
+        method: 'POST',
+        body: {
+          name: String(data.get('name') || '').trim(),
+          description: String(data.get('description') || '').trim(),
+          action: String(data.get('action') || 'Curate & summarize'),
+          schedule,
+        },
+      }).then((payload) => {
+        closeModal(false);
+        applyServerState({ automations: payload.automations });
+        renderPage();
+        showToast(`“${payload.automation.name}” is ready — ${payload.automation.triggerLabel.toLowerCase()}.`);
+      }).catch((error) => showToast(error.message, 'error'));
       return;
     }
     if (event.target.id === 'save-prompt-form') {

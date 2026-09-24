@@ -6,7 +6,10 @@ import { config, providerSummary } from './config.js';
 import { openDatabase } from './db.js';
 import { createGateway } from './gateway.js';
 import { createStore } from './store.js';
-import { AUTOMATION_TEMPLATES } from './seed.js';
+import { createAutomationRunner } from './automations.js';
+import { createScheduler } from './scheduler.js';
+import { buildAttachments, createFileStore, MAX_FILES_PER_REQUEST, parseMultipart } from './files.js';
+import { humanizeUntil, nextOccurrence, normalizeSchedule } from './schedule.js';
 import { ProviderError } from './providers/util.js';
 
 /**
@@ -20,6 +23,9 @@ import { ProviderError } from './providers/util.js';
 const db = openDatabase(config.dbPath);
 const store = createStore(db);
 const gateway = createGateway(config);
+const files = createFileStore({ db, store, uploadDir: config.uploadsDir });
+const automations = createAutomationRunner({ store, gateway });
+const scheduler = createScheduler({ store, runner: automations, config });
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -96,7 +102,7 @@ const routes = {
   'GET /api/health': async ({ res, url }) => {
     const probe = url.searchParams.get('probe') === '1';
     const providers = providerSummary();
-    if (!probe) return json(res, 200, { ok: true, mode: gateway.isDemoOnly() ? 'demo' : 'live', uptimeMs: Date.now() - startedAt, providers });
+    if (!probe) return json(res, 200, { ok: true, mode: gateway.isDemoOnly() ? 'demo' : 'live', uptimeMs: Date.now() - startedAt, providers, scheduler: scheduler.status() });
     const checks = await Promise.all(gateway.providers.filter((provider) => provider.isConfigured()).map(async (provider) => ({
       id: provider.id,
       ...(await provider.checkHealth({})),
@@ -121,6 +127,7 @@ const routes = {
       activity: store.listActivity(6),
       settings: store.getSettings(),
       usage: store.usageSummary(),
+      scheduler: scheduler.status(),
       capabilities: capabilities(),
     });
   },
@@ -157,18 +164,43 @@ const routes = {
     json(res, 201, { prompt, prompts: store.listPrompts() });
   },
 
-  'GET /api/automations': async ({ res }) => json(res, 200, { automations: store.listAutomations() }),
+  'GET /api/automations': async ({ res, url }) => {
+    const withRuns = url.searchParams.get('runs') === '1';
+    const automations = store.listAutomations().map((automation) => ({
+      ...automation,
+      nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
+      runs: withRuns ? store.listAutomationRuns(automation.id, 5).map(stripRunGeneration) : undefined,
+    }));
+    json(res, 200, { automations, scheduler: scheduler.status(), stats: store.automationRunStats(monthStartIso()) });
+  },
 
   'POST /api/automations': async ({ res, req }) => {
     const body = await readJsonBody(req);
+    const { schedule, error } = normalizeSchedule(body.schedule);
+    if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
     const automation = store.createAutomation({
       name: body.name,
       description: text(body.description, 400),
-      trigger: text(body.trigger, 120) || 'On demand',
       action: text(body.action, 80) || 'Curate & summarize',
+      schedule,
+      timeZone: store.getSettings().timezone || 'UTC',
     });
-    json(res, 201, { automation, automations: store.listAutomations() });
+    json(res, 201, { automation: withRunLabel(automation), automations: store.listAutomations().map(withRunLabel) });
   },
+
+  /** Scheduler health, for the Connections tab. */
+  'GET /api/scheduler': async ({ res }) => json(res, 200, scheduler.status()),
+
+  'GET /api/files': async ({ res, url }) => {
+    const projectId = url.searchParams.get('projectId');
+    json(res, 200, {
+      files: projectId ? store.filesForProject(projectId, Number(url.searchParams.get('limit')) || 50) : store.listFiles({ limit: Number(url.searchParams.get('limit')) || 50 }),
+      storage: files.stats(),
+    });
+  },
+
+  /** Multipart upload of reference material. */
+  'POST /api/files': async ({ res, req, url }) => handleUpload(req, res, url),
 
   'GET /api/usage': async ({ res }) => json(res, 200, store.usageSummary()),
 
@@ -187,6 +219,84 @@ const routes = {
   },
 };
 
+const withRunLabel = (automation) => ({
+  ...automation,
+  nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
+});
+
+/** Run rows carry their generation inline for the UI, but not in list payloads. */
+const stripRunGeneration = (run) => ({ ...run, generation: run.generation ? { id: run.generation.id, model: run.generation.model, status: run.generation.status, credits: run.generation.credits } : null });
+
+/**
+ * Uploads reference material for a generation. Accepts multipart/form-data
+ * (browser drag-and-drop or file picker) and returns the stored file records.
+ */
+async function handleUpload(req, res, url) {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.startsWith('multipart/form-data')) {
+    throw new ProviderError('Uploads must be sent as multipart/form-data', { status: 415, code: 'expected_multipart' });
+  }
+  const buffer = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_FILES_PER_REQUEST * 10 * 1024 * 1024 + 1_000_000) {
+      throw new ProviderError('That upload is too large', { status: 413, code: 'payload_too_large' });
+    }
+    buffer.push(chunk);
+  }
+  const parts = parseMultipart(Buffer.concat(buffer), contentType).filter((part) => part.data?.length);
+  if (!parts.length) throw new ProviderError('No files were found in the upload', { status: 400, code: 'no_files' });
+  if (parts.length > MAX_FILES_PER_REQUEST) {
+    throw new ProviderError(`Attach up to ${MAX_FILES_PER_REQUEST} files at once`, { status: 413, code: 'too_many_files' });
+  }
+
+  const projectId = url.searchParams.get('projectId') || parts.find((part) => part.name === 'projectId')?.data?.toString('utf8') || null;
+  const project = projectId ? store.getProject(projectId) : null;
+  const stored = parts.map((part) => files.write({
+    name: part.filename || part.name,
+    mime: part.type,
+    buffer: part.data,
+    kind: 'attachment',
+    projectId: project?.id || null,
+  }));
+
+  if (project) store.touchProject(project.id);
+  json(res, 201, { files: stored, project: project ? store.getProject(project.id) : null, storage: files.stats() });
+}
+
+/** Streams a stored upload with the headers a browser needs to show it inline. */
+async function serveStoredFile(res, req, id, download = false) {
+  const row = store.getFile(id);
+  if (!row) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
+  const body = await files.read(row);
+  res.writeHead(200, {
+    'Content-Type': row.mime,
+    'Content-Length': body.length,
+    'Cache-Control': 'private, max-age=300',
+    'Content-Disposition': `${download ? 'attachment' : 'inline'}; filename="${row.name.replace(/["\\]/g, '')}"`,
+    'X-Content-Type-Options': 'nosniff',
+  });
+  if (req.method === 'HEAD') return res.end();
+  res.end(body);
+}
+
+/**
+ * Event triggers run in the background: a status change should never make the
+ * user wait for a model to finish. Failures land in the run history.
+ */
+function fireEventAutomations(event, value, project) {
+  const matches = store.automationsForEvent(event, value);
+  for (const automation of matches) {
+    automations.execute({ automation, source: 'event', project })
+      .then((result) => {
+        if (result.status === 'succeeded') console.log(`⟳ “${automation.name}” ran on ${event}=${value}`);
+      })
+      .catch((error) => console.error(`⟳ “${automation.name}” event run failed: ${error.message}`));
+  }
+  return matches.length;
+}
+
 /** Capability flags so the UI can hide or explain what this build cannot do yet. */
 function capabilities() {
   return {
@@ -195,9 +305,12 @@ function capabilities() {
     persistence: 'sqlite',
     imageGeneration: gateway.listModels().models.some((model) => model.kind === 'image' && model.selectable),
     realProviders: providerSummary().some((provider) => provider.configured && provider.id !== 'mock'),
-    fileUploads: false,
+    fileUploads: true,
+    attachments: true,
+    fileStorage: 'local-disk',
     billing: false,
-    scheduling: false,
+    scheduling: Boolean(config.scheduler.enabled),
+    eventTriggers: true,
   };
 }
 
@@ -233,6 +346,10 @@ async function handleGenerate(req, res) {
   }
   if (!project && body.projectId) throw new ProviderError('That project no longer exists', { status: 404, code: 'project_not_found' });
 
+  // Reference files the user attached to this prompt.
+  const attachmentRows = Array.isArray(body.fileIds) ? store.filesByIds(body.fileIds) : [];
+  const attachments = attachmentRows.length ? await buildAttachments(files, attachmentRows) : [];
+
   const generationId = `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const abort = new AbortController();
   req.on('close', () => { if (!res.writableEnded) abort.abort(new Error('client disconnected')); });
@@ -248,7 +365,12 @@ async function handleGenerate(req, res) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
   };
 
-  send('meta', { generationId, projectId: project?.id || null, projectTitle: project?.title || '' });
+  send('meta', {
+    generationId,
+    projectId: project?.id || null,
+    projectTitle: project?.title || '',
+    references: attachments.map((item) => ({ id: item.id, name: item.name, kind: item.kind, bytes: item.bytes })),
+  });
 
   let accumulated = '';
   let summary = null;
@@ -263,8 +385,10 @@ async function handleGenerate(req, res) {
       system: text(body.system, 4_000),
       maxTokens: Math.min(Math.max(Number(body.maxTokens) || 1200, 64), 8_000),
       signal: abort.signal,
+      attachments,
     })) {
       if (event.type === 'start') {
+        send('references', { references: event.references || [], imagesSent: event.imagesSent || 0 });
         store.createGeneration({
           id: generationId,
           projectId: project?.id || null,
@@ -296,9 +420,23 @@ async function handleGenerate(req, res) {
       }
     }
 
+    // Generated images are written to disk and referenced by URL, so rows stay
+    // small and the browser can cache them like any other file.
+    let assetUrl = summary?.assetUrl || '';
+    let assetFile = null;
+    if (assetUrl.startsWith('data:')) {
+      assetFile = files.writeDataUrl({
+        dataUrl: assetUrl,
+        name: `${project?.title || 'generation'}`.replace(/[^\w.-]+/g, '-').slice(0, 60) || 'output',
+        projectId: project?.id || null,
+        generationId,
+      });
+      if (assetFile) assetUrl = assetFile.url;
+    }
+
     const finished = store.finishGeneration(generationId, {
       output: accumulated,
-      assetUrl: summary?.assetUrl || '',
+      assetUrl,
       status: failed ? 'failed' : 'succeeded',
       error: failure?.message || '',
       tokensIn: summary?.tokensIn || 0,
@@ -320,8 +458,8 @@ async function handleGenerate(req, res) {
     }
 
     send('done', {
-      generation: finished,
-      project: project ? store.getProject(project.id) : null,
+      generation: finished ? { ...finished, assetFile } : finished,
+      project: project ? { ...store.getProject(project.id), files: store.filesForProject(project.id, 50) } : null,
       activity: activity || store.listActivity(6),
       usage: store.usageSummary(),
       failed,
@@ -340,7 +478,7 @@ async function handleGenerate(req, res) {
 // Item routes with path parameters
 // ---------------------------------------------------------------------------
 
-async function handleItemRoute(req, res, pathname) {
+async function handleItemRoute(req, res, pathname, url = new URL('http://localhost/')) {
   const parts = pathname.split('/').filter(Boolean); // ['api', ...]
   const [, group, id, sub] = parts;
 
@@ -352,6 +490,7 @@ async function handleItemRoute(req, res, pathname) {
     }
     if (!sub && (req.method === 'PATCH' || req.method === 'PUT')) {
       const body = await readJsonBody(req);
+      const before = store.getProject(id);
       const project = store.updateProject(id, {
         title: body.title,
         type: body.type,
@@ -360,12 +499,17 @@ async function handleItemRoute(req, res, pathname) {
         prompt: body.prompt,
       });
       if (!project) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
-      return json(res, 200, { project });
+      const statusChanged = before && body.status && before.status !== project.status;
+      if (statusChanged) fireEventAutomations('project.status', project.status, project);
+      return json(res, 200, { project, triggeredAutomations: statusChanged ? store.automationsForEvent('project.status', project.status).map((automation) => automation.name) : [] });
     }
     if (!sub && req.method === 'DELETE') {
       const archived = store.archiveProject(id);
       if (!archived) return json(res, 404, { error: { message: 'Project not found', code: 'not_found' } });
       return json(res, 200, { archived: true, projects: store.listProjects() });
+    }
+    if (sub === 'files' && req.method === 'GET') {
+      return json(res, 200, { files: store.filesForProject(id, 100) });
     }
     if (sub === 'duplicate' && req.method === 'POST') {
       const project = store.duplicateProject(id);
@@ -383,103 +527,85 @@ async function handleItemRoute(req, res, pathname) {
   if (group === 'automations' && id) {
     if (!sub && (req.method === 'PATCH' || req.method === 'PUT')) {
       const body = await readJsonBody(req);
-      const automation = store.updateAutomation(id, {
+      const patch = {
         name: body.name,
         description: body.description,
-        trigger: body.trigger,
         action: body.action,
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
-      });
+      };
+      if (body.schedule !== undefined) {
+        const { schedule, error } = normalizeSchedule(body.schedule);
+        if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
+        patch.schedule = schedule;
+      }
+      const automation = store.updateAutomation(id, patch, { timeZone: store.getSettings().timezone || 'UTC' });
       if (!automation) return json(res, 404, { error: { message: 'Automation not found', code: 'not_found' } });
-      return json(res, 200, { automation });
+      return json(res, 200, { automation: withRunLabel(automation), automations: store.listAutomations().map(withRunLabel) });
     }
     if (sub === 'run' && req.method === 'POST') return runAutomation(res, id);
-    if (sub === 'runs' && req.method === 'GET') return json(res, 200, { runs: store.listAutomationRuns(id, 10) });
+    if (sub === 'runs' && req.method === 'GET') {
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 10, 1), 100);
+      return json(res, 200, { runs: store.listAutomationRuns(id, limit) });
+    }
+  }
+
+  if (group === 'files' && id) {
+    if (req.method === 'GET' || req.method === 'HEAD') return serveStoredFile(res, req, id, url.searchParams?.get('download') === '1');
+    if (req.method === 'DELETE') {
+      const removed = files.remove(id);
+      if (!removed) return json(res, 404, { error: { message: 'File not found', code: 'not_found' } });
+      return json(res, 200, { deleted: true, storage: files.stats() });
+    }
   }
 
   if (group === 'generations' && id && req.method === 'GET') {
     const generation = store.getGeneration(id);
     if (!generation) return json(res, 404, { error: { message: 'Generation not found', code: 'not_found' } });
-    return json(res, 200, { generation });
+    return json(res, 200, { generation, files: store.filesForGeneration(id) });
   }
 
   return json(res, 404, { error: { message: `No API route for ${req.method} ${pathname}`, code: 'not_found' } });
 }
 
 /**
- * "Run now" performs real work for generation-based actions and reports plainly
- * when an action is a workspace chore that is not automated yet.
+ * "Run now" goes through the same executor the scheduler uses, so manual and
+ * scheduled runs are recorded identically.
  */
 async function runAutomation(res, id) {
   const automation = store.getAutomation(id);
   if (!automation) return json(res, 404, { error: { message: 'Automation not found', code: 'not_found' } });
 
-  const template = AUTOMATION_TEMPLATES[automation.action];
-  if (!template || template.kind === 'navigate') {
-    store.recordAutomationRun({ automationId: id, status: 'skipped', note: 'Workspace chore — no generator step in this build.' });
-    return json(res, 200, {
-      automation: store.getAutomation(id),
-      status: 'skipped',
-      message: `“${automation.name}” is a workspace chore. Scheduling and non-generation steps arrive with the scheduler phase.`,
-    });
+  const result = await automations.execute({ automation, source: 'manual' });
+  if (result.status === 'failed') {
+    return json(res, 502, { error: { message: result.message, code: 'automation_failed' }, status: 'failed', output: result.output });
   }
 
-  const project = store.listProjects()[0] || null;
-  const prompt = template.buildPrompt({ project });
-  let accumulated = '';
-  let summary = null;
-
-  try {
-    for await (const event of gateway.run({ selection: 'Auto select', prompt, mode: 'Writing' })) {
-      if (event.type === 'delta') accumulated += event.text;
-      if (event.type === 'summary') summary = event;
-      if (event.type === 'error') throw new ProviderError(event.message, { code: event.code, hint: event.hint });
-    }
-  } catch (error) {
-    store.recordAutomationRun({ automationId: id, status: 'failed', note: error.message });
-    return fail(res, error);
-  }
-
-  const generation = summary ? store.createGeneration({
-    id: `g-${Date.now().toString(36)}-auto`,
-    projectId: project?.id || null,
-    provider: summary.provider,
-    modelId: summary.modelId,
-    modelLabel: summary.modelLabel,
-    kind: 'text',
-    mode: 'Writing',
-    prompt,
-    status: 'succeeded',
-  }) : null;
-
-  if (generation) {
-    store.finishGeneration(generation.id, {
-      output: accumulated,
-      status: 'succeeded',
-      tokensIn: summary.tokensIn,
-      tokensOut: summary.tokensOut,
-      credits: summary.credits,
-      costUsd: summary.costUsd,
-      latencyMs: summary.latencyMs,
-    });
-  }
-
-  store.recordAutomationRun({ automationId: id, generationId: generation?.id || null, status: 'succeeded', note: prompt.slice(0, 160) });
-  store.addActivity({
-    icon: 'workflow',
-    tone: 'green',
-    line: `<strong>${escapeForActivity(automation.name)}</strong> ran ${summary?.isDemo ? 'in demo mode' : 'successfully'}`,
-    project: project?.title || '',
-  });
+  // A manual run shifts the clock forward, so pressing Run never causes a
+  // duplicate scheduled run minutes later.
+  const settings = store.getSettings();
+  store.setNextRun(id, nextRunIso(automation, settings.timezone));
 
   json(res, 200, {
-    automation: store.getAutomation(id),
-    status: 'succeeded',
-    generation: generation ? store.getGeneration(generation.id) : null,
-    output: accumulated,
-    isDemo: Boolean(summary?.isDemo),
+    automation: withRunLabel(store.getAutomation(id)),
+    automations: store.listAutomations().map(withRunLabel),
+    status: result.status,
+    message: result.message,
+    generation: result.generation,
+    output: result.output,
+    isDemo: result.isDemo,
     usage: store.usageSummary(),
   });
+}
+
+/** Start of the current month in UTC, for the "runs this month" figure. */
+function monthStartIso() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+function nextRunIso(automation, timeZone) {
+  const next = nextOccurrence(automation.schedule, Date.now(), timeZone || 'UTC');
+  return next ? new Date(next).toISOString() : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +694,7 @@ const server = http.createServer(async (req, res) => {
       await handler({ req, res, url, pathname });
       return logRequest(req, pathname, res.statusCode, started);
     }
-    await handleItemRoute(req, res, pathname);
+    await handleItemRoute(req, res, pathname, url);
     logRequest(req, pathname, res.statusCode, started);
   } catch (error) {
     if (res.headersSent) {
@@ -614,7 +740,12 @@ server.listen(config.port, config.host, () => {
   console.log('  AI Studio OS');
   console.log(`  → http://localhost:${config.port}`);
   console.log(`  → database: ${config.dbPath}`);
+  console.log(`  → uploads:  ${config.uploadsDir}`);
   console.log(`  → ${mode}`);
   if (gateway.isDemoOnly()) console.log('  → add a provider key to .env for real generation (see .env.example)');
+
+  // Catch up on anything that came due while the server was off, once.
+  scheduler.tickOnce({ reason: 'startup' }).catch((error) => console.error('Startup schedule check failed:', error.message));
+  scheduler.start();
   console.log('');
 });

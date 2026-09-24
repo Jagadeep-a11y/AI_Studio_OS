@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { SEED_ACTIVITY, SEED_AUTOMATIONS, SEED_PROJECTS, SEED_PROMPTS, SEED_SETTINGS } from './seed.js';
+import { describeSchedule, nextOccurrence } from './schedule.js';
 
 /**
  * SQLite persistence layer.
@@ -87,15 +88,19 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 
 CREATE TABLE IF NOT EXISTS automations (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  trigger     TEXT NOT NULL DEFAULT 'On demand',
-  action      TEXT NOT NULL DEFAULT 'Curate & summarize',
-  last_run    TEXT,
-  enabled     INTEGER NOT NULL DEFAULT 1,
-  tone        TEXT NOT NULL DEFAULT 'purple',
-  created_at  TEXT NOT NULL
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  description  TEXT NOT NULL DEFAULT '',
+  trigger      TEXT NOT NULL DEFAULT 'On demand',
+  trigger_label TEXT NOT NULL DEFAULT 'Manual only',
+  schedule     TEXT,
+  next_run_at  TEXT,
+  last_status  TEXT,
+  action       TEXT NOT NULL DEFAULT 'Curate & summarize',
+  last_run     TEXT,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  tone         TEXT NOT NULL DEFAULT 'purple',
+  created_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS automation_runs (
@@ -106,6 +111,21 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   note          TEXT NOT NULL DEFAULT '',
   created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS files (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  mime          TEXT NOT NULL,
+  size          INTEGER NOT NULL DEFAULT 0,
+  path          TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'attachment',
+  excerpt       TEXT NOT NULL DEFAULT '',
+  project_id    TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  generation_id TEXT REFERENCES generations(id) ON DELETE SET NULL,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS files_project_idx ON files (project_id);
+CREATE INDEX IF NOT EXISTS files_generation_idx ON files (generation_id);
 
 CREATE TABLE IF NOT EXISTS activity (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,8 +150,28 @@ export function openDatabase(dbPath) {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  migrate(db);
   seedIfEmpty(db);
   return db;
+}
+
+/**
+ * Additive migrations for databases created by an earlier version.
+ *
+ * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so new columns are
+ * added deliberately here. The app is a prototype but it does keep a real
+ * database on disk, and losing a user's workspace to a schema change is not
+ * acceptable.
+ */
+function migrate(db) {
+  const columnsOf = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+  const addColumn = (table, name, definition) => {
+    if (!columnsOf(table).includes(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition};`);
+  };
+  addColumn('automations', 'schedule', 'TEXT');
+  addColumn('automations', 'trigger_label', "TEXT NOT NULL DEFAULT 'Manual only'");
+  addColumn('automations', 'next_run_at', 'TEXT');
+  addColumn('automations', 'last_status', 'TEXT');
 }
 
 function seedIfEmpty(db) {
@@ -148,10 +188,17 @@ function seedIfEmpty(db) {
   const insertPrompt = db.prepare('INSERT INTO prompts (id, title, category, icon, mode, body, uses, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   for (const prompt of SEED_PROMPTS) insertPrompt.run(prompt.id, prompt.title, prompt.category, prompt.icon, prompt.mode, prompt.text, prompt.uses, minutesAgoIso(5_000));
 
-  const insertAutomation = db.prepare(`INSERT INTO automations (id, name, description, trigger, action, last_run, enabled, tone, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insertAutomation = db.prepare(`INSERT INTO automations
+    (id, name, description, trigger, trigger_label, schedule, next_run_at, action, last_run, enabled, tone, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const automation of SEED_AUTOMATIONS) {
-    insertAutomation.run(automation.id, automation.name, automation.description, automation.trigger, automation.action, automation.lastRun, automation.enabled ? 1 : 0, automation.tone, minutesAgoIso(9_000));
+    const schedule = automation.schedule || { type: 'manual' };
+    const nextRun = nextOccurrence(schedule, Date.now(), SEED_SETTINGS.timezone);
+    insertAutomation.run(
+      automation.id, automation.name, automation.description, automation.trigger, describeSchedule(schedule),
+      JSON.stringify(schedule), nextRun ? new Date(nextRun).toISOString() : null,
+      automation.action, null, automation.enabled ? 1 : 0, automation.tone, minutesAgoIso(9_000),
+    );
   }
 
   const insertActivity = db.prepare('INSERT INTO activity (icon, tone, line, project, created_at) VALUES (?, ?, ?, ?, ?)');
@@ -214,15 +261,47 @@ export function promptFromRow(row) {
 
 export function automationFromRow(row, lastRun = null) {
   if (!row) return null;
+  let schedule = null;
+  try {
+    schedule = row.schedule ? JSON.parse(row.schedule) : null;
+  } catch {
+    schedule = null;
+  }
   return {
     id: row.id,
     name: row.name,
     description: row.description,
     trigger: row.trigger,
+    triggerLabel: row.trigger_label || describeSchedule(schedule),
+    schedule: schedule || { type: 'manual' },
+    nextRunAt: row.next_run_at || null,
     action: row.action,
     lastRun: lastRun || row.last_run || 'Not run yet',
+    lastRunAt: row.last_run || null,
+    lastStatus: row.last_status || null,
     enabled: Boolean(row.enabled),
     tone: row.tone,
+  };
+}
+
+export function fileFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    mime: row.mime,
+    size: row.size,
+    kind: row.kind,
+    // The stored filename (not a path): the file store resolves it against the
+    // uploads directory, and clients read files through `url` instead.
+    storedPath: row.path,
+    excerpt: row.excerpt || '',
+    projectId: row.project_id,
+    generationId: row.generation_id,
+    created: row.created_at,
+    url: `/api/files/${row.id}`,
+    isImage: String(row.mime || '').startsWith('image/'),
+    createdLabel: relativeTime(row.created_at),
   };
 }
 

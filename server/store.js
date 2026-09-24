@@ -1,12 +1,15 @@
 import {
   activityFromRow,
   automationFromRow,
+  fileFromRow,
   generationFromRow,
   newId,
   nowIso,
   projectFromRow,
   promptFromRow,
+  relativeTime,
 } from './db.js';
+import { describeSchedule, nextOccurrence } from './schedule.js';
 
 /**
  * Data access. Routes call these helpers so SQL stays in one layer and the
@@ -30,13 +33,31 @@ export function createStore(db) {
 
     automationsAll: db.prepare('SELECT * FROM automations ORDER BY created_at DESC'),
     automationOne: db.prepare('SELECT * FROM automations WHERE id = ?'),
-    automationInsert: db.prepare(`INSERT INTO automations (id, name, description, trigger, action, last_run, enabled, tone, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-    automationUpdate: db.prepare('UPDATE automations SET name = ?, description = ?, trigger = ?, action = ?, enabled = ?, tone = ?, last_run = ? WHERE id = ?'),
-    automationLastRun: db.prepare('UPDATE automations SET last_run = ? WHERE id = ?'),
+    automationInsert: db.prepare(`INSERT INTO automations
+      (id, name, description, trigger, trigger_label, schedule, next_run_at, action, last_run, enabled, tone, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    automationUpdate: db.prepare(`UPDATE automations SET name = ?, description = ?, trigger = ?, trigger_label = ?, schedule = ?,
+      next_run_at = ?, action = ?, enabled = ?, tone = ?, last_run = ? WHERE id = ?`),
+    automationLastRun: db.prepare('UPDATE automations SET last_run = ?, last_status = ? WHERE id = ?'),
+    automationNextRun: db.prepare('UPDATE automations SET next_run_at = ? WHERE id = ?'),
+    automationDue: db.prepare(`SELECT * FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?`),
+    automationByEvent: db.prepare('SELECT * FROM automations WHERE enabled = 1 AND schedule LIKE ?'),
+    scheduledAutomations: db.prepare(`SELECT * FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL`),
     lastRunFor: db.prepare('SELECT created_at FROM automation_runs WHERE automation_id = ? ORDER BY created_at DESC LIMIT 1'),
     runInsert: db.prepare('INSERT INTO automation_runs (id, automation_id, generation_id, status, note, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    runStats: db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS recent, MAX(created_at) AS last_at FROM automation_runs'),
     runsFor: db.prepare('SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY created_at DESC LIMIT ?'),
+    runOne: db.prepare('SELECT * FROM automation_runs WHERE id = ?'),
+
+    fileInsert: db.prepare(`INSERT INTO files (id, name, mime, size, path, kind, excerpt, project_id, generation_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    fileOne: db.prepare('SELECT * FROM files WHERE id = ?'),
+    filesForProject: db.prepare('SELECT * FROM files WHERE project_id = ? ORDER BY created_at DESC LIMIT ?'),
+    filesForGeneration: db.prepare('SELECT * FROM files WHERE generation_id = ? ORDER BY created_at ASC'),
+    filesRecent: db.prepare('SELECT * FROM files ORDER BY created_at DESC LIMIT ?'),
+    filesForIds: db.prepare('SELECT * FROM files WHERE id IN (SELECT value FROM json_each(?)) ORDER BY created_at ASC'),
+    fileDelete: db.prepare('DELETE FROM files WHERE id = ?'),
+    filesForProjectKind: db.prepare('SELECT * FROM files WHERE project_id = ? AND kind = ? ORDER BY created_at DESC'),
 
     activityAll: db.prepare('SELECT * FROM activity ORDER BY created_at DESC, id DESC LIMIT ?'),
     activityInsert: db.prepare('INSERT INTO activity (icon, tone, line, project, created_at) VALUES (?, ?, ?, ?, ?)'),
@@ -202,24 +223,56 @@ export function createStore(db) {
       const lastRun = statements.lastRunFor.get(row.id);
       return automationFromRow(row, lastRun ? lastRun.created_at : null);
     },
-    createAutomation({ name, description = '', trigger = 'On demand', action = 'Curate & summarize', enabled = true, tone = 'purple' }) {
+    createAutomation({ name, description = '', action = 'Curate & summarize', enabled = true, tone = 'purple', schedule = { type: 'manual' }, timeZone = 'UTC' }) {
       const id = newId('a');
-      statements.automationInsert.run(id, String(name || 'Untitled automation').slice(0, 120), description, trigger, action, 'Not run yet', enabled ? 1 : 0, tone, nowIso());
-      return this.getAutomation(id);
-    },
-    updateAutomation(id, patch = {}) {
-      const current = this.getAutomation(id);
-      if (!current) return null;
-      const merged = { ...current, ...definedOnly(patch) };
-      statements.automationUpdate.run(
-        merged.name, merged.description, merged.trigger, merged.action,
-        merged.enabled ? 1 : 0, merged.tone || 'purple', merged.lastRun || 'Not run yet', id,
+      const nextRun = nextOccurrence(schedule, Date.now(), timeZone);
+      statements.automationInsert.run(
+        id, String(name || 'Untitled automation').slice(0, 120), description, describeSchedule(schedule),
+        describeSchedule(schedule), JSON.stringify(schedule), nextRun ? new Date(nextRun).toISOString() : null,
+        action, null, enabled ? 1 : 0, tone, nowIso(),
       );
       return this.getAutomation(id);
     },
+    updateAutomation(id, patch = {}, { timeZone = 'UTC' } = {}) {
+      const current = this.getAutomation(id);
+      if (!current) return null;
+      const merged = { ...current, ...definedOnly(patch) };
+      const scheduleChanged = patch.schedule !== undefined;
+      const nextRun = !merged.enabled
+        ? null
+        : nextOccurrence(merged.schedule, Date.now(), timeZone);
+      statements.automationUpdate.run(
+        merged.name, merged.description, describeSchedule(merged.schedule), describeSchedule(merged.schedule),
+        JSON.stringify(merged.schedule), nextRun ? new Date(nextRun).toISOString() : null,
+        merged.action, merged.enabled ? 1 : 0, merged.tone || 'purple', merged.lastRunAt || null, id,
+      );
+      if (scheduleChanged && nextRun) statements.automationNextRun.run(new Date(nextRun).toISOString(), id);
+      return this.getAutomation(id);
+    },
+    /** Automations whose clock-based schedule is due, oldest first. */
+    dueAutomations(nowIsoValue = nowIso(), limit = 5) {
+      return statements.automationDue.all(nowIsoValue, limit).map((row) => automationFromRow(row, row.last_run));
+    },
+    automationsForEvent(event, value) {
+      const key = `%"event":"${event}"%"value":"${value}"%`;
+      return statements.automationByEvent.all(key).map((row) => automationFromRow(row, row.last_run));
+    },
+    scheduledAutomations() {
+      return statements.scheduledAutomations.all().map((row) => automationFromRow(row, row.last_run));
+    },
+    setNextRun(id, iso) {
+      statements.automationNextRun.run(iso, id);
+    },
+    /** Run counts for the automations page: all time, and since a cut-off. */
+    automationRunStats(sinceIso) {
+      const row = statements.runStats.get(sinceIso) || {};
+      return { total: Number(row.total) || 0, recent: Number(row.recent) || 0, lastRunAt: row.last_at || null };
+    },
     recordAutomationRun({ automationId, generationId = null, status = 'succeeded', note = '' }) {
-      statements.runInsert.run(newId('run'), automationId, generationId, status, note, nowIso());
-      statements.automationLastRun.run(nowIso(), automationId);
+      const id = newId('run');
+      statements.runInsert.run(id, automationId, generationId, status, note, nowIso());
+      statements.automationLastRun.run(nowIso(), status, automationId);
+      return id;
     },
     listAutomationRuns(automationId, limit = 5) {
       return statements.runsFor.all(automationId, limit).map((row) => ({
@@ -229,7 +282,39 @@ export function createStore(db) {
         status: row.status,
         note: row.note,
         created: row.created_at,
+        createdLabel: relativeTime(row.created_at),
+        generation: row.generation_id ? this.getGeneration(row.generation_id) : null,
       }));
+    },
+
+    // --- Files --------------------------------------------------------------
+    createFile({ id, name, mime, size, path: storedPath, kind = 'attachment', excerpt = '', projectId = null, generationId = null }) {
+      statements.fileInsert.run(id, name, mime, size, storedPath, kind, excerpt, projectId, generationId, nowIso());
+      return this.getFile(id);
+    },
+    getFile(id) {
+      return fileFromRow(statements.fileOne.get(id));
+    },
+    /** Raw row, for the file store's disk operations. */
+    getFileRow(id) {
+      return statements.fileOne.get(id) || null;
+    },
+    filesForGeneration(generationId) {
+      return statements.filesForGeneration.all(generationId).map(fileFromRow);
+    },
+    filesForProject(projectId, limit = 50) {
+      return statements.filesForProject.all(projectId, limit).map(fileFromRow);
+    },
+    filesByIds(ids = []) {
+      const clean = [...new Set(ids.filter((id) => typeof id === 'string' && id))].slice(0, 16);
+      if (!clean.length) return [];
+      return statements.filesForIds.all(JSON.stringify(clean)).map(fileFromRow);
+    },
+    listFiles({ limit = 50 } = {}) {
+      return statements.filesRecent.all(limit).map(fileFromRow);
+    },
+    deleteFile(id) {
+      statements.fileDelete.run(id);
     },
 
     // --- Activity -----------------------------------------------------------

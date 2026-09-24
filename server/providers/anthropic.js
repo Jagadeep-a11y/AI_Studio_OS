@@ -33,19 +33,29 @@ export function createAnthropicProvider(cfg) {
       return (payload.data || []).filter((model) => model?.id).map((model) => ({ id: model.id, kind: 'text' }));
     },
 
-    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal }) {
+    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal, images = [] }) {
       if (!cfg.apiKey) throw notConfigured(id, this.hint);
+      const content = images.length
+        ? [
+          ...images.map((image) => ({
+            type: 'image',
+            source: { type: 'base64', media_type: image.mime, data: String(image.dataUrl).split(',')[1] || '' },
+          })),
+          { type: 'text', text: prompt },
+        ]
+        : prompt;
       const response = await request(`${base()}/messages`, {
         provider: id,
         method: 'POST',
         headers: headers(),
         signal,
+        timeoutMs: cfg.timeoutMs,
         body: JSON.stringify({
           model,
           max_tokens: maxTokens,
           stream: true,
           system: system || undefined,
-          messages: [{ role: 'user', content: prompt }],
+          messages: [{ role: 'user', content }],
         }),
       });
       if (!response.ok) {

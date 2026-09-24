@@ -16,8 +16,16 @@ export function createGeminiProvider(cfg) {
 
   const clean = (model) => String(model).replace(/^models\//, '');
 
-  const payloadFor = ({ prompt, system, maxTokens, modalities }) => ({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  const payloadFor = ({ prompt, system, maxTokens, modalities, images = [] }) => ({
+    contents: [{
+      role: 'user',
+      parts: [
+        ...images.map((image) => ({
+          inline_data: { mime_type: image.mime, data: String(image.dataUrl).split(',')[1] || '' },
+        })),
+        { text: prompt },
+      ],
+    }],
     ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
     generationConfig: {
       maxOutputTokens: maxTokens,
@@ -48,7 +56,7 @@ export function createGeminiProvider(cfg) {
         }));
     },
 
-    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal }) {
+    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal, images = [] }) {
       if (!key()) throw notConfigured(id, this.hint);
       const url = `${base()}/models/${clean(model)}:streamGenerateContent?alt=sse`;
       const response = await request(url, {
@@ -56,7 +64,8 @@ export function createGeminiProvider(cfg) {
         method: 'POST',
         headers: headers(),
         signal,
-        body: JSON.stringify(payloadFor({ prompt, system, maxTokens })),
+        timeoutMs: cfg.timeoutMs,
+        body: JSON.stringify(payloadFor({ prompt, system, maxTokens, images })),
       });
       if (!response.ok) {
         const detail = await readErrorBody(response);
@@ -110,6 +119,7 @@ export function createGeminiProvider(cfg) {
         method: 'POST',
         headers: headers(),
         signal,
+        timeoutMs: cfg.timeoutMs,
         body: JSON.stringify(payloadFor({ prompt, maxTokens: 1024, modalities: ['IMAGE'] })),
       });
       if (!response.ok) {

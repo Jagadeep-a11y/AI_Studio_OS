@@ -24,13 +24,20 @@ Errors use one shape, and include a hint the UI shows verbatim:
 | `DELETE /api/projects/:id` | Archive (not delete) |
 | `POST /api/projects/:id/duplicate` | Copy a project |
 | `POST /api/generate` | **Stream a generation** |
-| `GET /api/generations/:id` | A single generation record |
+| `GET /api/generations/:id` | A single generation record plus its files |
 | `GET /api/prompts` · `POST /api/prompts` | Prompt library |
 | `POST /api/prompts/:id/use` | Increment a prompt's use count |
-| `GET /api/automations` · `POST /api/automations` | Workflows |
-| `PATCH /api/automations/:id` | Pause, enable, or edit |
+| `GET /api/automations` | Workflows (`?runs=1` includes each one's recent runs) |
+| `POST /api/automations` | Create a workflow, with a schedule |
+| `PATCH /api/automations/:id` | Pause, enable, edit, or reschedule |
 | `POST /api/automations/:id/run` | Run now (real generation for generator steps) |
-| `GET /api/automations/:id/runs` | Run history |
+| `GET /api/automations/:id/runs` | Run history (`?limit=`) |
+| `GET /api/scheduler` | Scheduler health: enabled, tick, counts, next automation |
+| `POST /api/files` | **Upload reference files** (multipart) |
+| `GET /api/files` | Stored files (`?projectId=`, `?limit=`) |
+| `GET /api/files/:id` | Serve a stored file (`?download=1` forces an attachment) |
+| `DELETE /api/files/:id` | Delete a stored file and its bytes |
+| `GET /api/projects/:id/files` | A project's reference files and generated assets |
 | `GET /api/usage` | Plan, totals, breakdowns, seven-day series, recent runs |
 | `GET /api/activity` | Dashboard feed (`?limit=`) |
 | `GET /api/settings` · `PUT /api/settings` | Workspace and profile settings |
@@ -52,9 +59,14 @@ curl -s localhost:4173/api/bootstrap | jq '{mode, projects: (.projects|length), 
   "models": [{ "id": "openai-gpt-4.1", "name": "GPT-4.1", "provider": "openai", "kind": "text",
                "selectable": false, "isDemo": false, "verified": null,
                "pricing": { "input": 2, "output": 8, "unit": "usd-per-million-tokens", "estimated": true } }],
+  "scheduler": { "enabled": true, "active": true, "tickMs": 30000, "timeZone": "Asia/Kolkata",
+                 "counts": { "ticks": 12, "runs": 1, "failures": 0 },
+                 "nextAutomation": { "id": "a-digest", "name": "Monday inspiration digest", "nextRunAt": "2026-09-28T03:30:00.000Z" } },
+  "files": [{ "id": "f-98…", "name": "brief.txt", "mime": "text/plain", "size": 97, "kind": "attachment", "isImage": false, "url": "/api/files/f-98…" }],
   "capabilities": { "generation": true, "streaming": true, "persistence": "sqlite",
                     "imageGeneration": true, "realProviders": false,
-                    "fileUploads": false, "billing": false, "scheduling": false } }
+                    "fileUploads": true, "attachments": true, "fileStorage": "local-disk",
+                    "billing": false, "scheduling": true, "eventTriggers": true } }
 ```
 
 `selectable` is false when the model's provider has no key. `verified` is `true`/`false` when the
@@ -118,6 +130,65 @@ Notes for clients:
 
 ---
 
+## `POST /api/generate` with reference files
+
+Send `fileIds` (from `POST /api/files`) with the request and the run carries them:
+
+```bash
+curl -sN localhost:4173/api/generate -H 'Content-Type: application/json' \
+  -d '{"prompt":"Match this brief","mode":"Writing","fileIds":["f-98…","f-5c…"]}'
+```
+
+```text
+event: meta
+data: {"generationId":"g-…","references":[{"id":"f-98…","name":"brief.txt","kind":"text","bytes":97}]}
+
+event: start
+data: {"provider":"mock","modelLabel":"Studio demo engine","kind":"text","imagesSent":1,"references":[…], …}
+```
+
+Images are forwarded to the provider as vision input; text documents are appended to the prompt as
+reference material. Anything the model cannot read is still stored and listed. If the run produces
+an image, `done.generation.assetUrl` is a `/api/files/…` URL and `done.generation.assetFile`
+describes the stored file.
+
+---
+
+## `POST /api/files`
+
+`multipart/form-data`, field name `files` (repeat up to 8 times), optional `?projectId=` to attach
+them to a project. 10 MB per file; allowed types are images, PDFs, and plain-text-ish documents.
+
+```bash
+curl -s -F "files=@brief.txt;type=text/plain" -F "files=@swatch.png" \
+  "localhost:4173/api/files?projectId=p-3f2a91c0"
+```
+
+```json
+{ "files": [{ "id": "f-98…", "name": "brief.txt", "mime": "text/plain", "size": 97,
+              "kind": "attachment", "isImage": false, "excerpt": "Studio brief…",
+              "url": "/api/files/f-98…" }],
+  "project": { "id": "p-3f2a91c0", "files": [ … ] },
+  "storage": { "count": 2, "bytes": 258 } }
+```
+
+Text files come back with an `excerpt`; images are previewed in the UI by `url`. Bytes live in
+`data/uploads/` (`AI_STUDIO_UPLOADS` overrides), never in a database row.
+
+---
+
+## `GET /api/scheduler`
+
+```json
+{ "enabled": true, "active": true, "tickMs": 30000, "timeZone": "Asia/Kolkata",
+  "startedAt": "2026-09-24T05:31:02.114Z", "lastTickAt": "2026-09-24T05:41:00.004Z",
+  "lastResult": { "reason": "timer", "due": 1, "outcomes": [{ "automation": "Monday inspiration digest", "status": "succeeded" }] },
+  "counts": { "ticks": 20, "runs": 1, "failures": 0 },
+  "nextAutomation": { "id": "a-digest", "name": "Monday inspiration digest", "nextRunAt": "2026-09-28T03:30:00.000Z" } }
+```
+
+---
+
 ## `GET /api/usage`
 
 ```json
@@ -142,7 +213,26 @@ Runs an automation's mapped generator step through the gateway and records the r
 ```
 
 Automations whose action is a workspace chore rather than a generation reply
-`{ "status": "skipped", "message": "…" }` — the scheduler phase implements those.
+`{ "status": "skipped", "message": "…" }` — nothing is written, and the run is still recorded so
+the history does not quietly lose it.
+
+### Schedules
+
+`POST` and `PATCH /api/automations` accept a `schedule` object. Anything else is rejected with
+`400 invalid_schedule` and a hint the UI shows.
+
+| Type | Shape | Meaning |
+| --- | --- | --- |
+| `interval` | `{ "type": "interval", "everyMinutes": 60 }` | Every hour (minimum 6 seconds) |
+| `daily` | `{ "type": "daily", "time": "09:00", "daysOfWeek": [1] }` | Mondays at 09:00 (1 = Monday; omit the array for every day) |
+| `monthly` | `{ "type": "monthly", "day": 1, "time": "09:00" }` | The 1st of each month (day 1–28) |
+| `event` | `{ "type": "event", "event": "project.status", "value": "In review" }` | Whenever a project is marked “In review” |
+| `manual` | `{ "type": "manual" }` | Only when someone presses Run |
+
+`time` is a wall-clock time in the workspace timezone (`GET /api/settings` → `timezone`). Automation
+rows carry `nextRunAt`, `nextRunLabel`, `triggerLabel`, `lastStatus`, and `lastRun`, so a client can
+render the schedule without knowing the schedule rules. A manual run moves `nextRunAt` forward, so
+pressing Run never causes a duplicate run minutes later.
 
 ---
 
@@ -154,3 +244,7 @@ Automations whose action is a workspace chore rather than a generation reply
 - Request bodies are capped at 1 MB; malformed JSON returns `400 invalid_json`.
 - `OPTIONS` is answered for every route; `Access-Control-Allow-Origin` echoes the request origin.
 - `AI_STUDIO_QUIET=1` disables the access log for cleaner test output.
+- Uploads are capped at 8 files × 10 MB per request; larger bodies are rejected with `413` before
+  anything is written to disk.
+- Changing a project's `status` to a value an event automation watches fires that automation in the
+  background — the `PATCH` response returns immediately and lists what it triggered.

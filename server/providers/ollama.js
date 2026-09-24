@@ -30,7 +30,7 @@ export function createOllamaProvider(cfg) {
       return (payload.models || []).filter((model) => model?.name).map((model) => ({ id: model.name, kind: 'text' }));
     },
 
-    async *streamText({ model, prompt, system = '', signal }) {
+    async *streamText({ model, prompt, system = '', signal, images = [] }) {
       if (!cfg.enabled) throw notConfigured(id, this.hint);
       const response = await request(`${base()}/api/chat`, {
         provider: id,
@@ -44,7 +44,8 @@ export function createOllamaProvider(cfg) {
           stream: true,
           messages: [
             ...(system ? [{ role: 'system', content: system }] : []),
-            { role: 'user', content: prompt },
+            // Ollama takes raw base64 for vision models and ignores it otherwise.
+            { role: 'user', content: prompt, ...(images.length ? { images: images.map((image) => String(image.dataUrl).split(',')[1] || '') } : {}) },
           ],
           options: { num_predict: 1200 },
         }),

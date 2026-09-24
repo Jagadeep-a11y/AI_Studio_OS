@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,8 +41,11 @@ const str = (key, fallback = '') => {
   return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();
 };
 
+/** Note: Number('') is 0, so an unset variable must be caught before parsing. */
 const num = (key, fallback) => {
-  const value = Number(str(key, ''));
+  const raw = str(key, '');
+  if (raw === '') return fallback;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 };
 
@@ -67,13 +71,37 @@ function resolveDbPath(value) {
   return path.isAbsolute(value) ? value : path.resolve(ROOT, value);
 }
 
+/**
+ * Uploads sit next to the database by default, so "where is my data?" has one
+ * answer. A throwaway database gets a throwaway upload directory instead of
+ * scattering test files through the repository.
+ */
+function resolveUploadsDir(explicit, dbPath) {
+  if (explicit) return path.isAbsolute(explicit) ? explicit : path.resolve(ROOT, explicit);
+  if (dbPath === ':memory:' || dbPath.startsWith('file:')) {
+    return path.join(os.tmpdir(), 'ai-studio-os-uploads');
+  }
+  return path.join(path.dirname(dbPath), 'uploads');
+}
+
+const requestTimeoutMs = num('AI_STUDIO_TIMEOUT_MS', 60_000);
+
 export const config = {
   root: ROOT,
   host: str('AI_STUDIO_HOST', '0.0.0.0'),
   port: positiveInt('PORT', positiveInt('AI_STUDIO_PORT', 4173)),
   dbPath: resolveDbPath(str('AI_STUDIO_DB', './data/studio.db')),
   workspace: str('AI_STUDIO_WORKSPACE', 'Northstar Studio'),
-  timeoutMs: num('AI_STUDIO_TIMEOUT_MS', 60_000),
+  timeoutMs: requestTimeoutMs,
+  uploadsDir: '',
+  scheduler: {
+    enabled: bool('AI_STUDIO_SCHEDULER', true),
+    // Floors rather than limits: a tick every 500ms is fine for tests, a tick
+    // every 30s is sane in normal use, and neither can be set to zero.
+    tickMs: Math.max(250, num('AI_STUDIO_SCHEDULER_TICK_MS', 30_000)),
+    maxPerTick: Math.min(10, positiveInt('AI_STUDIO_SCHEDULER_MAX_PER_TICK', 3)),
+    backoffMs: Math.max(5_000, num('AI_STUDIO_SCHEDULER_BACKOFF_MS', 5 * 60_000)),
+  },
   allowMock: bool('AI_STUDIO_ALLOW_MOCK', true),
   providerOrder: str('AI_STUDIO_PROVIDER_ORDER', 'openai,anthropic,gemini,ollama,mock')
     .split(',')
@@ -82,21 +110,25 @@ export const config = {
   envFileLoaded: Boolean(env.OPENAI_API_KEY || env.ANTHROPIC_API_KEY || env.GEMINI_API_KEY),
   providers: {
     openai: {
+      timeoutMs: requestTimeoutMs,
       apiKey: str('OPENAI_API_KEY', ''),
       baseUrl: str('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
       chatPath: str('OPENAI_CHAT_PATH', '/chat/completions'),
       imagesPath: str('OPENAI_IMAGES_PATH', '/images/generations'),
     },
     anthropic: {
+      timeoutMs: requestTimeoutMs,
       apiKey: str('ANTHROPIC_API_KEY', ''),
       baseUrl: str('ANTHROPIC_BASE_URL', 'https://api.anthropic.com/v1'),
       version: str('ANTHROPIC_VERSION', '2023-06-01'),
     },
     gemini: {
+      timeoutMs: requestTimeoutMs,
       apiKey: str('GEMINI_API_KEY', str('GOOGLE_API_KEY', '')),
       baseUrl: str('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
     },
     ollama: {
+      timeoutMs: requestTimeoutMs,
       enabled: bool('OLLAMA_ENABLED', false),
       baseUrl: str('OLLAMA_BASE_URL', 'http://127.0.0.1:11434'),
     },
@@ -106,6 +138,8 @@ export const config = {
     },
   },
 };
+
+config.uploadsDir = resolveUploadsDir(str('AI_STUDIO_UPLOADS', ''), config.dbPath);
 
 /** Secrets never travel to the browser; this is the only shape clients ever see. */
 export function providerSummary() {

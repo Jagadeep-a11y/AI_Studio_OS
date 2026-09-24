@@ -33,13 +33,19 @@ export function createOpenAIProvider(cfg) {
         .map((model) => ({ id: model.id, kind: /image|dall-e/i.test(model.id) ? 'image' : 'text' }));
     },
 
-    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal }) {
+    async *streamText({ model, prompt, system = '', maxTokens = 1200, signal, images = [] }) {
       if (!cfg.apiKey) throw notConfigured(id, this.hint);
+      // Reference images ride along as data URLs; plain text prompts keep the
+      // simpler string content so older models behave exactly as before.
+      const content = images.length
+        ? [{ type: 'text', text: prompt }, ...images.map((image) => ({ type: 'image_url', image_url: { url: image.dataUrl } }))]
+        : prompt;
       const response = await request(`${base()}${cfg.chatPath}`, {
         provider: id,
         method: 'POST',
         headers: headers(),
         signal,
+        timeoutMs: cfg.timeoutMs,
         body: JSON.stringify({
           model,
           stream: true,
@@ -47,7 +53,7 @@ export function createOpenAIProvider(cfg) {
           stream_options: { include_usage: true },
           messages: [
             ...(system ? [{ role: 'system', content: system }] : []),
-            { role: 'user', content: prompt },
+            { role: 'user', content },
           ],
         }),
       });
@@ -106,6 +112,7 @@ export function createOpenAIProvider(cfg) {
         method: 'POST',
         headers: headers(),
         signal,
+        timeoutMs: cfg.timeoutMs,
         body: JSON.stringify({ model, prompt, n: 1, size }),
       });
       if (!response.ok) {
