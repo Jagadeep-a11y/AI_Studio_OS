@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#171625" />
+  <meta name="description" content="Studio OS — one thoughtful workspace for every AI model, project, and creative workflow." />
+  <title>AI Studio OS — Your creative workspace</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- A small inline icon set keeps the prototype fast and dependency-free. -->
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3 1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2L12 3Z"/><path d="m19 14 .9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9L19 14ZM5 3l.8 2.2L8 6l-2.2.8L5 9l-.8-2.2L2 6l2.2-.8L5 3Z"/></symbol>
+    <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="5" rx="2"/><rect x="13" y="10" width="8" height="11" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5v-10Z"/><path d="M3.5 10h17"/></symbol>
+    <symbol id="i-canvas" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="m8 15 3-7 2.1 4.3L15 10l2 5H8Z"/><circle cx="16.5" cy="7.5" r="1"/></symbol>
+    <symbol id="i-models" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4.3 7.7 7.7 4.5 7.7-4.5M12 12.2V21"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21V5.5Z"/><path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20M8 7h8M8 10h6"/></symbol>
+    <symbol id="i-workflow" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="6" rx="2"/><rect x="14" y="15" width="7" height="6" rx="2"/><rect x="14" y="3" width="7" height="6" rx="2"/><path d="M10 6h4M17.5 9v3a3 3 0 0 1-3 3H10"/><path d="m10 12-3 3 3 3"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V5M4 19h17"/><path d="m7 15 4-4 3 2 6-7"/><path d="M16 6h4v4"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1a1.8 1.8 0 0 1-2.5 2.5l-.1-.1a1.8 1.8 0 0 0-3 .9v.2a1.8 1.8 0 0 1-3.6 0v-.2a1.8 1.8 0 0 0-3-.9l-.1.1a1.8 1.8 0 0 1-2.5-2.5l.1-.1a1.8 1.8 0 0 0-.9-3h-.2a1.8 1.8 0 0 1 0-3.6h.2a1.8 1.8 0 0 0 .9-3l-.1-.1a1.8 1.8 0 0 1 2.5-2.5l.1.1a1.8 1.8 0 0 0 3-.9v-.2a1.8 1.8 0 0 1 3.6 0v.2a1.8 1.8 0 0 0 3 .9l.1-.1a1.8 1.8 0 0 1 2.5 2.5l-.1.1a1.8 1.8 0 0 0 .9 3h.2a1.8 1.8 0 0 1 0 3.6h-.2a1.8 1.8 0 0 0-.9 3Z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="i-arrow-up-right" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-wand" viewBox="0 0 24 24"><path d="m4 20 12-12M14 6l4 4M3 8l2 2M9 2l1 3M19 15l3 1M17 3l-1 3"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5" width="14" height="14" rx="3"/><path d="m17 10 4-3v10l-4-3z"/><path d="m9 9 4 3-4 3V9Z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 8-4 4 4 4m8-8 4 4-4 4m-3-11-2 14"/></symbol>
+    <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 10v4m4-8v12m4-15v18m4-13v8m4-11v14"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-lightning" viewBox="0 0 24 24"><path d="m13 2-9 12h7l-1 8 10-13h-7l1-7Z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M2 14h4m4-6h4m4 8h4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9A7 7 0 0 1 17 6l3 6M4 12l3 6a7 7 0 0 0 11.5-3"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m18 6-12 12M6 6l12 12"/></symbol>
+    <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 7V5a2 2 0 1 0-2 2h10a2 2 0 1 0-2-2v14a2 2 0 1 0 2-2H7a2 2 0 1 0 2 2V7Z"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 19v2h16v-2"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7V5Z"/></symbol>
+    <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M20 11.5 12.4 19a4.6 4.6 0 0 1-6.5-6.5l7.4-7.4a3.1 3.1 0 0 1 4.4 4.4l-7.4 7.4a1.6 1.6 0 0 1-2.2-2.2l6.6-6.6"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-1 12a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7"/></symbol>
+    <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.6 9a2.5 2.5 0 1 1 4.3 1.8c-1.2 1.2-1.9 1.5-1.9 3.2m0 3v.1"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6Z"/><path d="M14 3v6h6M8 13h8M8 17h8"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></symbol>
+    <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M4 6h15a2 2 0 0 1 2 2v11H5a2 2 0 0 1-2-2V6a3 3 0 0 1 3-3h11v3"/><path d="M21 11h-5a2 2 0 0 0 0 4h5"/><path d="M16 13h.01"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.2 6.2 0 0 1 12.4 0"/><path d="M16.5 5.6a3.2 3.2 0 0 1 0 6.3M17.5 14.4A6.2 6.2 0 0 1 21.4 20"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 8l-4 4 4 4M6 12h9"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v6c0 4.2 2.9 7.7 7 9 4.1-1.3 7-4.8 7-9V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="3.5"/><path d="m10.6 12.6 8-8M16 5.5 18.5 8M14 8l2.5 2.5"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <div class="mobile-scrim" id="mobile-scrim" aria-hidden="true"></div>
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#overview" data-page="overview" aria-label="Studio OS home">
+        <span class="brand-mark"><svg class="icon"><use href="#i-sparkles"/></svg></span>
+        <span class="brand-wordmark">AI Studio<span>OS</span><small>CREATIVE WORKSPACE</small></span>
+      </a>
+
+      <button class="workspace-switcher" type="button" data-action="workspace-menu" aria-haspopup="menu">
+        <span class="workspace-avatar" id="workspace-initial">N</span>
+        <span class="workspace-copy"><strong id="workspace-name">Northstar Studio</strong><small id="workspace-note">Loading…</small></span>
+        <svg class="icon icon-small"><use href="#i-chevron-down"/></svg>
+      </button>
+
+      <nav class="side-nav" aria-label="Workspace">
+        <p class="nav-label">Workspace</p>
+        <a class="nav-link is-active" href="#overview" data-page="overview"><svg class="icon"><use href="#i-overview"/></svg><span>Overview</span></a>
+        <a class="nav-link" href="#projects" data-page="projects"><svg class="icon"><use href="#i-folder"/></svg><span>Projects</span><span class="nav-count" id="project-count">6</span></a>
+        <a class="nav-link" href="#canvas" data-page="canvas"><svg class="icon"><use href="#i-canvas"/></svg><span>Canvas</span><span class="nav-tag">NEW</span></a>
+        <a class="nav-link" href="#models" data-page="models"><svg class="icon"><use href="#i-models"/></svg><span>Models</span></a>
+
+        <p class="nav-label nav-label-spaced">Your tools</p>
+        <a class="nav-link" href="#prompts" data-page="prompts"><svg class="icon"><use href="#i-book"/></svg><span>Prompt library</span></a>
+        <a class="nav-link" href="#automations" data-page="automations"><svg class="icon"><use href="#i-workflow"/></svg><span>Automations</span></a>
+        <a class="nav-link" href="#team" data-page="team"><svg class="icon"><use href="#i-users"/></svg><span>Team</span><span class="nav-count" id="member-count" hidden>1</span></a>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+      <div class="plan-card">
+        <div class="plan-heading"><span class="plan-icon"><svg class="icon"><use href="#i-lightning"/></svg></span><span>Studio plan</span><span class="plan-percent">68%</span></div>
+        <div class="plan-progress"><span></span></div>
+        <p><strong id="sidebar-credits">6,820</strong> of 10,000 credits used</p>
+        <button type="button" data-page="usage" class="plan-link">Manage plan <svg class="icon icon-small"><use href="#i-arrow-up-right"/></svg></button>
+      </div>
+      <a class="nav-link nav-usage" href="#usage" data-page="usage"><svg class="icon"><use href="#i-chart"/></svg><span>Usage & billing</span></a>
+      <a class="nav-link" href="#settings" data-page="settings"><svg class="icon"><use href="#i-settings"/></svg><span>Settings</span></a>
+      <div class="sidebar-divider"></div>
+      <button class="profile-button" type="button" data-action="profile-menu" aria-haspopup="menu">
+        <span class="profile-avatar" id="profile-avatar">AC</span>
+        <span class="profile-copy"><strong id="profile-name">Alex Chen</strong><small id="profile-role">Pro member</small></span>
+        <svg class="icon icon-small"><use href="#i-more"/></svg>
+      </button>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-button mobile-menu-button" type="button" data-action="toggle-sidebar" aria-label="Open navigation"><svg class="icon"><use href="#i-menu"/></svg></button>
+          <div class="breadcrumbs"><span id="breadcrumb-workspace">Northstar Studio</span><svg class="icon icon-tiny"><use href="#i-chevron"/></svg><strong id="current-page-name">Overview</strong></div>
+        </div>
+        <div class="topbar-actions">
+          <button class="env-pill" type="button" data-action="backend-status" aria-label="Generation backend status" title="Generation backend status">
+            <span class="env-dot"></span><span id="env-label">Demo mode</span>
+          </button>
+          <button class="command-search" type="button" data-action="open-command" aria-label="Search or jump to"><svg class="icon"><use href="#i-search"/></svg><span>Search anything...</span><kbd><svg class="icon icon-tiny"><use href="#i-command"/></svg> K</kbd></button>
+          <span class="role-pill" id="role-pill" hidden></span>
+          <span class="topbar-divider"></span>
+          <button class="icon-button help-button" type="button" data-action="help" aria-label="Help and shortcuts"><svg class="icon"><use href="#i-help"/></svg></button>
+          <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="Notifications"><svg class="icon"><use href="#i-bell"/></svg><span class="notification-dot"></span></button>
+          <button class="topbar-avatar" type="button" data-action="profile-menu" aria-label="Profile menu" id="topbar-avatar">AC</button>
+        </div>
+      </header>
+
+      <main class="main-content" id="main-content" tabindex="-1">
+        <div class="page-content" id="app-content" aria-live="polite"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Sign-in gate. Hidden until the server says the visitor has no session. -->
+  <div class="auth-screen" id="auth-screen" hidden>
+    <div class="auth-panel">
+      <div class="auth-brand">
+        <span class="brand-mark"><svg class="icon"><use href="#i-sparkles"/></svg></span>
+        <span class="brand-wordmark">AI Studio<span>OS</span><small>CREATIVE WORKSPACE</small></span>
+      </div>
+      <div class="auth-card" id="auth-card"></div>
+    </div>
+  </div>
+
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="modal-root"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>
