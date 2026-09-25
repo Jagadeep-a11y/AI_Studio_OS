@@ -16,6 +16,8 @@ plain Node with the built-in SQLite driver.
 │  server/gateway.js  model resolution · streaming · credits          │
 │  server/scheduler.js  claim-then-run clock for due workflows        │
 │  server/automations.js  one executor for manual/scheduled/event runs │
+│  server/webhook.js     outbound webhooks behind an allow list        │
+│  server/exports.js     project → Markdown / zip, used by steps       │
 │  server/files.js    uploads, disk storage, attachment prep          │
 │  server/schedule.js schedule shapes · timezone math · next run      │
 │  server/store.js    data access (all SQL)                           │
@@ -159,8 +161,10 @@ migration keeps its projects, generations, settings, and activity.
 - **generations** — the unit of truth for usage: provider, model id and label, kind, mode, prompt,
   output text, optional asset, status, error, tokens, credits, cost, latency, timestamps.
 - **prompts** — the library, with real use counts.
-- **automations / automation_runs** — workflows with a structured `schedule` (JSON), the `next_run_at`
-  the scheduler claims, and a run history linked to the generation each run produced.
+- **automations / automation_runs / automation_step_runs** — workflows with a structured `schedule`
+  (JSON) and a `steps` chain, the `next_run_at` the scheduler claims, a run ledger that is opened
+  when a run starts and closed when it ends, and one row per step with its status, message, duration,
+  and attempt count. A run history that only says "failed" is not worth keeping.
 - **files** — uploads and generated assets: name, mime, size, kind (`attachment` / `output`), the
   stored filename, a text excerpt for prompt use, and the project/generation they belong to.
 - **settings** — per-workspace preferences and timezone; a `(workspace_id, key)` table so new
@@ -193,6 +197,50 @@ Event triggers take the same path. A `PATCH /api/projects/:id` that changes a st
 automations watching that value and runs them in the background, so the HTTP response is not held
 open by a model call. The run history records its source (`manual`, `scheduled`, `event`), which is
 why the same executor exists in one place.
+
+## Automation steps
+
+An automation is a chain, not a button. `server/automations.js` walks the list in order and stops at
+the first failure, recording the remaining steps as `skipped` — a partial run is a result worth
+reporting accurately, not something to smooth over by carrying on.
+
+Four kinds, and the reasons they are the four:
+
+- **generate** — the only step that spends money, so it is the only one that touches the gateway.
+- **export** — `server/exports.js` builds a Markdown brief or a zip. The zip writer in
+  `server/zip.js` is written out (STORE method, CRC-32, central directory) rather than added as a
+  dependency; the test reads the archive back through its own central directory and recomputes every
+  checksum, so a file that merely *looks* like a zip fails the suite.
+- **tidy** — the "Organize projects" chore that previous phases honestly reported as unbuildable now
+  archives finished work. It is capped at ten projects per run: a chore that can wipe a workspace in
+  one tick is not a chore.
+- **webhook** — the one step that makes the server call a URL, which is why it gets its own module.
+
+**Retries are decided by the layer that knows.** `isTransient()` trusts an explicit `retryable` flag
+(from the provider helpers or the S3 client) over any guess made from a status code, retries
+`429`/`5xx`/timeouts/socket errors with exponential backoff, and never retries a `4xx` — a rejected
+payload posted twice is just rejected twice.
+
+**A run is a ledger, not a summary.** `automation_runs` is written when the run starts (status
+`running`) and updated when it ends, and `automation_step_runs` carries a row per step. That is what
+makes the run log answer "which step broke, how long did it take, did it retry?" — and why a server
+that dies mid-run leaves an `interrupted` run behind instead of silence.
+
+## Outbound webhooks
+
+The webhook step is an SSRF primitive: whoever can edit an automation can otherwise aim a POST at
+anything the server can reach, including `169.254.169.254`. `server/webhook.js` therefore requires
+an operator to name the hosts:
+
+- `AI_STUDIO_WEBHOOK_ALLOW` is empty by default, which turns the step *off* — at creation time (the
+  API refuses it) and in the UI (the option is disabled and labelled). A feature that is off should
+  not look like one that is broken.
+- An exact allow-list entry may point anywhere, including loopback: that is an operator naming a
+  target, which is exactly what a local collector or sidecar needs.
+- A `*.suffix` wildcard resolves the name and refuses private, loopback, link-local, and
+  unique-local addresses, so a wildcard cannot become a route into the private network.
+- `http`/`https` only, `redirect: 'error'`, a hard timeout, and a bounded response slice in the
+  error so the run log says "answered 404: channel_not_found" rather than "failed".
 
 ## Storage drivers
 
@@ -294,10 +342,15 @@ Two layers, both running the real code rather than mocks:
   file with every provider key blanked, then drives the API the way a browser does — including
   reading complete SSE streams and asserting the generation rows, credits, project output count,
   and usage aggregates that result. It also covers static serving, secret-exposure checks,
-  archiving, duplication, prompt counters, automation runs, error paths (missing prompt, malformed
-  JSON, unconfigured provider, 404s), multipart uploads, attachments reaching the prompt, generated
-  assets landing on disk, an event trigger firing from a status change, and a scheduled workflow
-  running on its own — the test boots the scheduler with a fast tick so the real timer is exercised.
+  archiving, duplication, prompt counters, error paths (missing prompt, malformed JSON, unconfigured
+  provider, 404s), multipart uploads, attachments reaching the prompt, generated assets landing on
+  disk, an event trigger firing from a status change, and a scheduled workflow running on its own —
+  the test boots the scheduler with a fast tick so the real timer is exercised. Automation steps are
+  driven end to end against a local HTTP receiver: a three-step chain, a zip export whose central
+  directory is read back and checksum-verified, a retry that really calls twice, a rejection that
+  really calls once, an archive pass with its dry run, and the webhook guard with DNS stubbed —
+  metadata addresses, wildcards resolving to private space, off-list hosts, and non-HTTP schemes are
+  all refused in the suite rather than in production.
   Accounts, roles, invites, tenancy isolation and the migration from a pre-accounts database are in
   the same file, and so is object storage: it starts an in-memory S3 whose verifier rebuilds the
   canonical request from what actually arrived, then drives a second server instance configured to
@@ -308,8 +361,10 @@ Two layers, both running the real code rather than mocks:
   and drives the real UI: page navigation, catalogue filtering, the Connections tab, an image
   generation and a writing generation with their streamed output and persisted history, attaching a
   reference file and confirming the dialog reports it, reading run history on the automations page,
-  building a schedule through the modal, opening a project's stored files, testing the storage
-  driver from the Connections tab, saving a prompt, and using the command palette. It signs up at
+  building a schedule and a two-step chain through the modal (including the disabled webhook option
+  when the server has no allow list), opening a project's stored files, expanding a run in the run
+  log to read its steps, testing the storage driver from the Connections tab, saving a prompt, and
+  using the command palette. It signs up at
   the gate, invites a second person, accepts that invite in a second window, and verifies the
   read-only role from both sides. It fails on any uncaught error, unhandled rejection, or
   `console.error`.

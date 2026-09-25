@@ -272,17 +272,25 @@ function createWorkspaceStore(db, workspaceId, root) {
     automationsAll: db.prepare('SELECT * FROM automations WHERE workspace_id = ? ORDER BY created_at DESC'),
     automationOne: db.prepare('SELECT * FROM automations WHERE id = ? AND workspace_id = ?'),
     automationInsert: db.prepare(`INSERT INTO automations
-      (id, workspace_id, name, description, trigger, trigger_label, schedule, next_run_at, action, last_run, enabled, tone, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+      (id, workspace_id, name, description, trigger, trigger_label, schedule, next_run_at, action, steps, time_zone, last_run, enabled, tone, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     automationUpdate: db.prepare(`UPDATE automations SET name = ?, description = ?, trigger = ?, trigger_label = ?, schedule = ?,
-      next_run_at = ?, action = ?, enabled = ?, tone = ?, last_run = ? WHERE id = ? AND workspace_id = ?`),
+      next_run_at = ?, action = ?, steps = ?, time_zone = ?, enabled = ?, tone = ?, last_run = ? WHERE id = ? AND workspace_id = ?`),
     automationLastRun: db.prepare('UPDATE automations SET last_run = ?, last_status = ? WHERE id = ? AND workspace_id = ?'),
     automationNextRun: db.prepare('UPDATE automations SET next_run_at = ? WHERE id = ? AND workspace_id = ?'),
     automationDue: db.prepare('SELECT * FROM automations WHERE workspace_id = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT ?'),
     automationByEvent: db.prepare('SELECT * FROM automations WHERE workspace_id = ? AND enabled = 1 AND schedule LIKE ?'),
     scheduledAutomations: db.prepare('SELECT * FROM automations WHERE workspace_id = ? AND enabled = 1 AND next_run_at IS NOT NULL'),
     lastRunFor: db.prepare('SELECT created_at FROM automation_runs WHERE automation_id = ? ORDER BY created_at DESC LIMIT 1'),
-    runInsert: db.prepare('INSERT INTO automation_runs (id, automation_id, generation_id, status, note, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    runStart: db.prepare("INSERT INTO automation_runs (id, automation_id, generation_id, status, note, created_at) VALUES (?, ?, NULL, 'running', ?, ?)"),
+    runFinish: db.prepare('UPDATE automation_runs SET status = ?, generation_id = COALESCE(?, generation_id), note = ? WHERE id = ?'),
+    stepInsert: db.prepare(`INSERT INTO automation_step_runs
+      (id, run_id, automation_id, position, action, status, message, ms, attempts, generation_id, file_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    stepsForRun: db.prepare('SELECT * FROM automation_step_runs WHERE run_id = ? ORDER BY position ASC'),
+    runsRecent: db.prepare(`SELECT r.*, a.name AS automation_name FROM automation_runs r
+      JOIN automations a ON a.id = r.automation_id
+      WHERE a.workspace_id = ? ORDER BY r.created_at DESC LIMIT ?`),
     runStats: db.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS recent, MAX(created_at) AS last_at
       FROM automation_runs WHERE automation_id IN (SELECT id FROM automations WHERE workspace_id = ?)`),
     runsFor: db.prepare(`SELECT * FROM automation_runs WHERE automation_id IN (SELECT id FROM automations WHERE id = ? AND workspace_id = ?)
@@ -478,13 +486,14 @@ function createWorkspaceStore(db, workspaceId, root) {
       const last = statements.lastRunFor.get(row.id);
       return automationFromRow(row, last?.created_at || row.last_run);
     },
-    createAutomation({ name, description = '', action = 'Curate & summarize', enabled = true, tone = 'purple', schedule = { type: 'manual' }, timeZone = 'UTC' }) {
+    createAutomation({ name, description = '', action = 'Curate & summarize', steps = null, enabled = true, tone = 'purple', schedule = { type: 'manual' }, timeZone = 'UTC' }) {
       const id = newId('a');
-      const nextRun = nextOccurrence(schedule, Date.now(), timeZone);
+      const zone = timeZone || 'UTC';
+      const nextRun = nextOccurrence(schedule, Date.now(), zone);
       statements.automationInsert.run(
         id, workspaceId, String(name || 'Untitled automation').slice(0, 120), description, describeSchedule(schedule),
         describeSchedule(schedule), JSON.stringify(schedule), nextRun ? new Date(nextRun).toISOString() : null,
-        action, null, enabled ? 1 : 0, tone, nowIso(),
+        action, steps?.length ? JSON.stringify(steps) : null, zone, null, enabled ? 1 : 0, tone, nowIso(),
       );
       return this.getAutomation(id);
     },
@@ -492,14 +501,17 @@ function createWorkspaceStore(db, workspaceId, root) {
       const current = this.getAutomation(id);
       if (!current) return null;
       const merged = { ...current, ...definedOnly(patch) };
-      const scheduleChanged = patch.schedule !== undefined;
-      const nextRun = !merged.enabled ? null : nextOccurrence(merged.schedule, Date.now(), timeZone);
+      // An automation can carry its own zone; a Monday 9am digest should mean
+      // 9am where the studio is, not where the server happens to run.
+      const zone = patch.timeZone || merged.timeZone || timeZone || 'UTC';
+      const nextRun = !merged.enabled ? null : nextOccurrence(merged.schedule, Date.now(), zone);
       statements.automationUpdate.run(
         merged.name, merged.description, describeSchedule(merged.schedule), describeSchedule(merged.schedule),
         JSON.stringify(merged.schedule), nextRun ? new Date(nextRun).toISOString() : null,
-        merged.action, merged.enabled ? 1 : 0, merged.tone || 'purple', merged.lastRunAt || null, id, workspaceId,
+        merged.action, merged.steps?.length ? JSON.stringify(merged.steps) : null, zone,
+        merged.enabled ? 1 : 0, merged.tone || 'purple', merged.lastRunAt || null, id, workspaceId,
       );
-      if (scheduleChanged && nextRun) statements.automationNextRun.run(new Date(nextRun).toISOString(), id, workspaceId);
+      if (nextRun) statements.automationNextRun.run(new Date(nextRun).toISOString(), id, workspaceId);
       return this.getAutomation(id);
     },
     /** Automations whose clock-based schedule is due, oldest first. */
@@ -521,23 +533,33 @@ function createWorkspaceStore(db, workspaceId, root) {
       const row = statements.runStats.get(sinceIso, workspaceId) || {};
       return { total: Number(row.total) || 0, recent: Number(row.recent) || 0, lastRunAt: row.last_at || null };
     },
-    recordAutomationRun({ automationId, generationId = null, status = 'succeeded', note = '' }) {
+    /**
+     * A run is opened before its first step and closed after the last, so a run
+     * that is still in flight reads as `running` rather than not existing.
+     */
+    startAutomationRun({ automationId, note = '' }) {
       const id = newId('run');
-      statements.runInsert.run(id, automationId, generationId, status, note, nowIso());
-      statements.automationLastRun.run(nowIso(), status, automationId, workspaceId);
+      statements.runStart.run(id, automationId, String(note).slice(0, 400), nowIso());
       return id;
     },
+    finishAutomationRun(id, { status = 'succeeded', generationId = null, note = '' } = {}) {
+      statements.runFinish.run(status, generationId, String(note).slice(0, 400), id);
+      const row = statements.runOne.get(id);
+      if (row) statements.automationLastRun.run(row.created_at, status, row.automation_id, workspaceId);
+      return row ? runFromRow(row, null, statements.stepsForRun.all(row.id), (id) => this.getGeneration(id)) : null;
+    },
+    recordStepRun({ runId, automationId, index = 0, action, status = 'succeeded', message = '', ms = 0, attempts = 1, generationId = null, fileId = null }) {
+      statements.stepInsert.run(newId('step'), runId, automationId, index, action, status, String(message).slice(0, 600), Math.round(ms), Math.max(1, Number(attempts) || 1), generationId, fileId, nowIso());
+    },
     listAutomationRuns(automationId, limit = 5) {
-      return statements.runsFor.all(automationId, workspaceId, limit).map((row) => ({
-        id: row.id,
-        automationId: row.automation_id,
-        generationId: row.generation_id,
-        status: row.status,
-        note: row.note,
-        created: row.created_at,
-        createdLabel: relativeTime(row.created_at),
-        generation: row.generation_id ? this.getGeneration(row.generation_id) : null,
-      }));
+      const name = statements.automationOne.get(automationId, workspaceId)?.name || null;
+      return statements.runsFor.all(automationId, workspaceId, limit)
+        .map((row) => runFromRow(row, name, statements.stepsForRun.all(row.id), (id) => this.getGeneration(id)));
+    },
+    /** Every recent run in the workspace, newest first — the run log. */
+    recentAutomationRuns(limit = 25) {
+      return statements.runsRecent.all(workspaceId, limit)
+        .map((row) => runFromRow(row, row.automation_name, statements.stepsForRun.all(row.id), (id) => this.getGeneration(id)));
     },
 
     /** The workspace this store is scoped to. Object keys are namespaced by it. */
@@ -667,6 +689,46 @@ export function defaultSettings(workspaceName = 'My workspace') {
  * Drops keys the caller did not actually send, so a partial PATCH never blanks
  * an existing column with `undefined`.
  */
+/**
+ * A run row as the API shows it. Step rows are the run's spine: they say which
+ * step failed and why, which is the difference between "the automation broke"
+ * and "Slack answered 404".
+ *
+ * A run left `running` by a process that died is reported as `interrupted`
+ * rather than pretending it is still going.
+ */
+function runFromRow(row, automationName = null, stepRows = [], resolveGeneration = null) {
+  const steps = stepRows.map(stepFromRow);
+  const ageMs = Date.now() - new Date(row.created_at).getTime();
+  const status = row.status === 'running' && ageMs > 15 * 60_000 ? 'interrupted' : row.status;
+  return {
+    id: row.id,
+    automationId: row.automation_id,
+    automationName,
+    generationId: row.generation_id,
+    status,
+    note: row.note,
+    created: row.created_at,
+    createdLabel: relativeTime(row.created_at),
+    durationMs: steps.length ? steps.reduce((total, step) => total + step.ms, 0) : null,
+    steps,
+    failedStep: steps.find((step) => step.status === 'failed') || null,
+    generation: row.generation_id && resolveGeneration ? resolveGeneration(row.generation_id) : null,
+  };
+}
+
+const stepFromRow = (row) => ({
+  id: row.id,
+  position: row.position,
+  action: row.action,
+  status: row.status,
+  message: row.message,
+  ms: row.ms,
+  attempts: Number(row.attempts) || 1,
+  generationId: row.generation_id,
+  fileId: row.file_id,
+});
+
 function definedOnly(patch) {
   return Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined && value !== null));
 }

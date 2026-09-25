@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS automations (
   next_run_at  TEXT,
   last_status  TEXT,
   action       TEXT NOT NULL DEFAULT 'Curate & summarize',
+  steps        TEXT,
+  time_zone    TEXT,
   last_run     TEXT,
   enabled      INTEGER NOT NULL DEFAULT 1,
   tone         TEXT NOT NULL DEFAULT 'purple',
@@ -114,6 +116,21 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   generation_id TEXT REFERENCES generations(id) ON DELETE SET NULL,
   status        TEXT NOT NULL,
   note          TEXT NOT NULL DEFAULT '',
+  created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS automation_step_runs (
+  id            TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL REFERENCES automation_runs(id) ON DELETE CASCADE,
+  automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+  position      INTEGER NOT NULL,
+  action        TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  message       TEXT NOT NULL DEFAULT '',
+  ms            INTEGER NOT NULL DEFAULT 0,
+  attempts      INTEGER NOT NULL DEFAULT 1,
+  generation_id TEXT,
+  file_id       TEXT,
   created_at    TEXT NOT NULL
 );
 
@@ -219,6 +236,7 @@ CREATE INDEX IF NOT EXISTS prompts_workspace_idx ON prompts (workspace_id);
 CREATE INDEX IF NOT EXISTS automations_workspace_idx ON automations (workspace_id);
 CREATE INDEX IF NOT EXISTS files_workspace_idx ON files (workspace_id);
 CREATE INDEX IF NOT EXISTS activity_workspace_idx ON activity (workspace_id);
+CREATE INDEX IF NOT EXISTS step_runs_run_idx ON automation_step_runs (run_id, position);
 CREATE INDEX IF NOT EXISTS files_project_idx ON files (project_id);
 CREATE INDEX IF NOT EXISTS files_generation_idx ON files (generation_id);
 `;
@@ -257,6 +275,10 @@ function migrate(db) {
   db.prepare("UPDATE files SET storage_key = path WHERE storage_key IS NULL").run();
 
   addColumn('automations', 'schedule', 'TEXT');
+  // Chain steps and a per-automation time zone (a Monday 9am digest should mean
+  // 9am where the studio is, not where the server happens to run).
+  addColumn('automations', 'steps', 'TEXT');
+  addColumn('automations', 'time_zone', 'TEXT');
   addColumn('automations', 'trigger_label', "TEXT NOT NULL DEFAULT 'Manual only'");
   addColumn('automations', 'next_run_at', 'TEXT');
   addColumn('automations', 'last_status', 'TEXT');
@@ -416,6 +438,17 @@ export function promptFromRow(row) {
   return { id: row.id, title: row.title, category: row.category, icon: row.icon, mode: row.mode, text: row.body, uses: row.uses };
 }
 
+/** Stored steps are JSON; a malformed value must not take the page down. */
+function parseSteps(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 export function automationFromRow(row, lastRun = null) {
   if (!row) return null;
   let schedule = null;
@@ -433,6 +466,8 @@ export function automationFromRow(row, lastRun = null) {
     schedule: schedule || { type: 'manual' },
     nextRunAt: row.next_run_at || null,
     action: row.action,
+    steps: parseSteps(row.steps),
+    timeZone: row.time_zone || null,
     lastRun: lastRun || row.last_run || 'Not run yet',
     lastRunAt: row.last_run || null,
     lastStatus: row.last_status || null,

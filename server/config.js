@@ -184,6 +184,22 @@ config.storage = {
 };
 
 /**
+ * Automations.
+ *
+ * `webhookAllow` is empty by default, which turns the webhook step *off*
+ * entirely rather than leaving an open POST endpoint that anyone who can edit
+ * an automation could aim at the network the server runs on. An operator opts
+ * in per host.
+ */
+config.automations = {
+  webhookAllow: str('AI_STUDIO_WEBHOOK_ALLOW', '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean),
+  webhookTimeoutMs: Math.max(1_000, num('AI_STUDIO_WEBHOOK_TIMEOUT_MS', 10_000)),
+};
+
+/**
  * Accounts and sessions. The defaults are sized for a small studio: a month-long
  * sliding session, week-long invites, and sign-in throttling that stops a
  * password-guessing loop without locking anyone out of their own workspace.

@@ -429,6 +429,54 @@ await app.submit('#automation-form');
 for (let i = 0; i < 40 && !($('#app-content').innerHTML || '').includes('Smoke test heartbeat'); i += 1) await wait(100);
 check('Created automation is listed with its schedule', ($('#app-content').innerHTML || '').includes('Every 45 minutes'), 'new row rendered');
 
+// The row shows the chain it will run, not a category name.
+const rowHtml = $('#app-content').innerHTML || '';
+check('Workflows show their step chain', rowHtml.includes('step-chain') && rowHtml.includes('>Generate<'), 'chain pills rendered');
+check('Chore workflows show their own step', rowHtml.includes('Tidy'), 'tidy pill rendered');
+
+// The builder: add a step and pick what it is.
+await app.click('[data-action="new-automation"]');
+await wait(80);
+check('The builder starts with one step', window.document.querySelectorAll('[data-step-row]').length === 1, `${window.document.querySelectorAll('[data-step-row]').length} rows`);
+check('The webhook step is unavailable without an allow list', [...window.document.querySelectorAll('[data-step-kind] option')].some((option) => option.value === 'webhook' && option.disabled), 'webhook option disabled');
+await app.click('[data-action="add-step"]');
+await wait(60);
+check('A second step can be added', window.document.querySelectorAll('[data-step-row]').length === 2, `${window.document.querySelectorAll('[data-step-row]').length} rows`);
+const secondKind = window.document.querySelectorAll('[data-step-kind]')[1];
+secondKind.value = 'export';
+secondKind.dispatchEvent(new window.Event('change', { bubbles: true }));
+await wait(60);
+check('A step can be changed to an export', window.document.querySelectorAll('[data-step-row]')[1].innerHTML.includes('data-step-option="format"'), 'export options rendered');
+const formatSelect = window.document.querySelectorAll('[data-step-option="format"]')[0];
+formatSelect.value = 'zip';
+$('#automation-name').value = 'Smoke chain';
+$('#automation-kind').value = 'manual';
+$('#automation-kind').dispatchEvent(new window.Event('change', { bubbles: true }));
+await app.submit('#automation-form');
+for (let i = 0; i < 40 && !($('#app-content').innerHTML || '').includes('Smoke chain'); i += 1) await wait(100);
+const chained = $('#app-content').innerHTML || '';
+check('A two-step chain is created and shown', chained.includes('Smoke chain') && chained.includes('Generate') && chained.includes('zip'), 'chain row rendered');
+// Order matters: the chain should read Generate → Export, not alphabetically.
+const chainRow = [...window.document.querySelectorAll('.automation-row')].find((row) => row.textContent.includes('Smoke chain'));
+const chainText = chainRow?.querySelector('.step-chain')?.textContent || '';
+check('The chain keeps its order', /Generate\s*→\s*Export/.test(chainText.replace(/\s+/g, ' ')), chainText.replace(/\s+/g, ' ').slice(0, 60));
+
+// Running it should record steps that the run log can show.
+await app.click('[data-action="run-automation"][data-id]');
+await wait(200);
+for (let i = 0; i < 60 && !($('#app-content').innerHTML || '').includes('run-log'); i += 1) await wait(150);
+const logHtml = $('#app-content').innerHTML || '';
+check('The run log lists runs', logHtml.includes('run-log') && logHtml.includes('Run log'), 'run log rendered');
+const runHead = window.document.querySelector('.run-log-head');
+check('A logged run can be opened', Boolean(runHead));
+if (runHead) {
+  runHead.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await wait(200);
+  const opened = $('#app-content').innerHTML || '';
+  check('Opening a run shows each step', opened.includes('run-step') && /run-step-message/.test(opened), 'steps rendered');
+  check('A step reports what it did', /Generated|Exported|Archive|Posted/.test($('.run-log-row.is-open')?.textContent || ''), ($('.run-log-row.is-open')?.textContent || '').slice(0, 90));
+}
+
 console.log('\nProject detail + history');
 if ($('#automation-form')) { await app.click('[data-action="close-modal"]'); await wait(60); }
 await app.click('.sidebar .nav-link[data-page="projects"]');

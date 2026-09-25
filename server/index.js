@@ -6,8 +6,9 @@ import { config, providerSummary } from './config.js';
 import { openDatabase } from './db.js';
 import { createGateway } from './gateway.js';
 import { createStore } from './store.js';
-import { createAutomationRunner } from './automations.js';
+import { createAutomationRunner, normalizeSteps, STEP_KINDS } from './automations.js';
 import { createScheduler } from './scheduler.js';
+import { createWebhookSender } from './webhook.js';
 import { createAccounts } from './accounts.js';
 import { escapeText } from './html.js';
 import { clearCookie, parseCookies, roleRank, sameOrigin, serializeCookie } from './auth.js';
@@ -31,7 +32,8 @@ const parseCookiesHeader = (header) => parseCookies(header);
 const gateway = createGateway(config);
 const storage = createStorage({ storage: config.storage });
 const files = createFileStore({ storage });
-const automations = createAutomationRunner({ store, gateway });
+const webhooks = createWebhookSender({ allow: config.automations.webhookAllow, timeoutMs: config.automations.webhookTimeoutMs });
+const automations = createAutomationRunner({ store, gateway, files, webhooks });
 const scheduler = createScheduler({ store, accounts, runner: automations, config });
 
 const MIME = {
@@ -341,12 +343,18 @@ const routes = {
     guard(ctx, 'read');
     const { res, url, data } = ctx;
     const withRuns = url.searchParams.get('runs') === '1';
-    const automations = data.listAutomations().map((automation) => ({
-      ...automation,
-      nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
+    // Named `rows`, not `automations`: the runner is module-scoped under that
+    // name, and shadowing it here is a temporal-dead-zone error at request time.
+    const rows = data.listAutomations().map((automation) => ({
+      ...withRunLabel(automation),
       runs: withRuns ? data.listAutomationRuns(automation.id, 5).map(stripRunGeneration) : undefined,
     }));
-    json(res, 200, { automations, scheduler: scheduler.status(ctx.workspace.id), stats: data.automationRunStats(monthStartIso()) });
+    json(res, 200, {
+      automations: rows,
+      scheduler: scheduler.status(ctx.workspace.id),
+      stats: data.automationRunStats(monthStartIso()),
+      stepCatalog: automations.catalog(),
+    });
   },
 
   'POST /api/automations': async (ctx) => {
@@ -355,14 +363,31 @@ const routes = {
     const body = await readJsonBody(req);
     const { schedule, error } = normalizeSchedule(body.schedule);
     if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
+    const steps = resolveSteps(body);
     const automation = data.createAutomation({
       name: body.name,
       description: text(body.description, 400),
-      action: text(body.action, 80) || 'Curate & summarize',
+      action: steps[0].action,
+      steps,
       schedule,
-      timeZone: data.getSettings().timezone || 'UTC',
+      // A new automation inherits the workspace zone unless it names its own.
+      timeZone: text(body.timeZone, 60) || data.getSettings().timezone || 'UTC',
     });
     json(res, 201, { automation: withRunLabel(automation), automations: data.listAutomations().map(withRunLabel) });
+  },
+
+  /**
+   * The workspace run log: every recent run, newest first, with its steps. A
+   * scheduled automation that broke at 3am should be readable the next morning
+   * without opening the source.
+   */
+  'GET /api/automation-runs': async (ctx) => {
+    guard(ctx, 'read');
+    const limit = Math.min(Math.max(Number(ctx.url.searchParams.get('limit')) || 25, 1), 100);
+    json(ctx.res, 200, {
+      runs: ctx.data.recentAutomationRuns(limit).map(stripRunGeneration),
+      stats: ctx.data.automationRunStats(monthStartIso()),
+    });
   },
 
   /** Scheduler health, for the Connections tab. */
@@ -492,9 +517,27 @@ const roleHint = (role, capability) => (capability === 'own'
   : `Only an owner or an admin of that workspace can do that — yours is ${role}.`);
 
 /** Adds the human label the UI shows next to a scheduled workflow. */
+/**
+ * Steps from a request body. `steps` is the current shape; `action` is the
+ * older one and is mapped forward, so an old client keeps working.
+ */
+function resolveSteps(body) {
+  const { steps, error } = normalizeSteps({ steps: body.steps, action: body.action });
+  if (error) throw new ProviderError(error, { status: 400, code: 'invalid_steps' });
+  if (steps.some((step) => step.action === 'webhook') && !automations.webhooksEnabled()) {
+    throw new ProviderError('This server does not allow outbound webhooks', {
+      status: 400,
+      code: 'webhook_disabled',
+      hint: 'An operator turns them on with AI_STUDIO_WEBHOOK_ALLOW, for example AI_STUDIO_WEBHOOK_ALLOW=hooks.slack.com.',
+    });
+  }
+  return steps;
+}
+
 const withRunLabel = (automation) => ({
   ...automation,
   nextRunLabel: automation.nextRunAt ? humanizeUntil(new Date(automation.nextRunAt).getTime()) : null,
+  steps: automations.stepsOf(automation),
 });
 
 /** Roles an actor may hand out — the UI uses it to disable impossible choices. */
@@ -977,9 +1020,14 @@ async function handleItemRoute(ctx) {
       const patch = {
         name: body.name,
         description: body.description,
-        action: body.action,
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
       };
+      if (body.steps !== undefined || body.action !== undefined) {
+        const steps = resolveSteps(body);
+        patch.steps = steps;
+        patch.action = steps[0].action;
+      }
+      if (body.timeZone !== undefined) patch.timeZone = text(body.timeZone, 60) || null;
       if (body.schedule !== undefined) {
         const { schedule, error } = normalizeSchedule(body.schedule);
         if (error) throw new ProviderError(error, { status: 400, code: 'invalid_schedule' });
@@ -995,7 +1043,7 @@ async function handleItemRoute(ctx) {
     }
     if (sub === 'runs' && req.method === 'GET') {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 10, 1), 100);
-      return json(res, 200, { runs: data.listAutomationRuns(id, limit) });
+      return json(res, 200, { runs: data.listAutomationRuns(id, limit).map(stripRunGeneration) });
     }
   }
 
@@ -1029,19 +1077,27 @@ async function runAutomation(ctx, id) {
 
   const result = await automations.execute({ automation, source: 'manual', data });
   if (result.status === 'failed') {
-    return json(res, 502, { error: { message: result.message, code: 'automation_failed' }, status: 'failed', output: result.output });
+    return json(res, 502, {
+      error: { message: result.message, code: 'automation_failed', hint: result.hint || undefined },
+      status: 'failed',
+      steps: result.steps,
+      output: result.output,
+    });
   }
 
   // A manual run shifts the clock forward, so pressing Run never causes a
   // duplicate scheduled run minutes later.
   const settings = data.getSettings();
-  data.setNextRun(id, nextRunIso(automation, settings.timezone));
+  data.setNextRun(id, nextRunIso(automation, automation.timeZone || settings.timezone));
 
   json(res, 200, {
     automation: withRunLabel(data.getAutomation(id)),
     automations: data.listAutomations().map(withRunLabel),
     status: result.status,
     message: result.message,
+    hint: result.hint || null,
+    steps: result.steps,
+    files: result.files || [],
     generation: result.generation,
     output: result.output,
     isDemo: result.isDemo,

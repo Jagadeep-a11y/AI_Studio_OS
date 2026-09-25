@@ -1,10 +1,14 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { createFakeS3 } from './fixtures/fake-s3.js';
+import { isTransient, normalizeSteps } from './automations.js';
+import { archiveName, crc32 } from './zip.js';
+import { createWebhookSender, privateReason } from './webhook.js';
 
 /**
  * End-to-end self test.
@@ -52,6 +56,35 @@ async function waitForServer(target = base, timeoutMs = 15_000) {
 }
 
 /** Polls until `predicate` returns a truthy value, or gives up. */
+/**
+ * Reads a zip back through its own central directory. Written here rather than
+ * trusting the writer: entry names, sizes, offsets, and checksums are all read
+ * from the bytes a downloader would receive.
+ */
+function readZipDirectory(buffer) {
+  const end = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (end < 0) return [];
+  const count = buffer.readUInt16LE(end + 10);
+  let cursor = buffer.readUInt32LE(end + 16);
+  const entries = [];
+  for (let index = 0; index < count; index += 1) {
+    if (buffer.readUInt32LE(cursor) !== 0x02014b50) break;
+    const crc = buffer.readUInt32LE(cursor + 16);
+    const size = buffer.readUInt32LE(cursor + 24);
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extraLength = buffer.readUInt16LE(cursor + 30);
+    const commentLength = buffer.readUInt16LE(cursor + 32);
+    const localOffset = buffer.readUInt32LE(cursor + 42);
+    const name = buffer.slice(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    const localName = buffer.readUInt16LE(localOffset + 26);
+    const localExtra = buffer.readUInt16LE(localOffset + 28);
+    const start = localOffset + 30 + localName + localExtra;
+    entries.push({ name, crc, size, data: buffer.slice(start, start + size) });
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
 async function waitUntil(predicate, { timeoutMs = 6000, intervalMs = 150 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -175,7 +208,15 @@ function startServer({ dbFile, uploadPath, serverPort, extraEnv = {} }) {
   return child;
 }
 
-const child = startServer({ dbFile: dbPath, uploadPath: uploadDir, serverPort: port });
+const child = startServer({
+  dbFile: dbPath,
+  uploadPath: uploadDir,
+  serverPort: port,
+  // Webhooks are off unless an operator names a host. The test server names the
+  // loopback address so a local receiver can be called — exactly what an
+  // operator running a sidecar would do.
+  extraEnv: { AI_STUDIO_WEBHOOK_ALLOW: '127.0.0.1' },
+});
 
 const cleanup = () => {
   if (!child.killed) child.kill('SIGTERM');
@@ -317,8 +358,13 @@ try {
   check('Manual runs push the next run forward', run.body.automation?.nextRunAt && new Date(run.body.automation.nextRunAt) > new Date());
   const runs = await owner.get('/api/automations/a-digest/runs');
   check('GET /api/automations/:id/runs lists history', runs.body.runs?.length >= 1);
-  const skipped = await owner.post('/api/automations/a-archive/run');
-  check('Non-generation chore reports honestly', skipped.body.status === 'skipped' && /generator|workflow/i.test(skipped.body.message), JSON.stringify(skipped.body).slice(0, 120));
+  const tidied = await owner.post('/api/automations/a-archive/run');
+  check('A workspace chore now runs instead of reporting a gap', ['succeeded', 'skipped'].includes(tidied.body.status) && /tidy|archive|project/i.test(tidied.body.message), JSON.stringify(tidied.body).slice(0, 140));
+  check('The chore records its step in the run log', tidied.body.steps?.length === 1 && tidied.body.steps[0].action === 'tidy', JSON.stringify(tidied.body.steps));
+  check('The run history carries steps, not just a status', run.body.steps?.[0]?.action === 'generate' && run.body.steps[0].status === 'succeeded', JSON.stringify(run.body.steps));
+  const digestRuns = await owner.get('/api/automations/a-digest/runs');
+  check('A stored run keeps its step chain', digestRuns.body.runs?.[0]?.steps?.[0]?.action === 'generate', JSON.stringify(digestRuns.body.runs?.[0]?.steps));
+  check('A run reports how long its steps took', digestRuns.body.runs?.[0]?.durationMs >= 0 && digestRuns.body.runs[0].status === 'succeeded');
 
   // --- Reference files -----------------------------------------------------
   console.log('\nFiles and references');
@@ -357,10 +403,13 @@ try {
   await owner.patch(`/api/projects/${project.id}`, { status: 'In review' });
   const eventRun = await waitUntil(async () => {
     const body = await owner.get('/api/automations/a-review/runs');
-    return body.body.runs?.length ? body.body.runs[0] : null;
+    const latest = body.body.runs?.[0];
+    // A run is visible the moment it starts, so wait for it to finish.
+    return latest && latest.status !== 'running' ? latest : null;
   });
-  check('Status change fires the matching automation', eventRun?.status === 'succeeded', eventRun ? eventRun.note : 'no run recorded');
+  check('Status change fires the matching automation', eventRun?.status === 'succeeded', eventRun ? `${eventRun.status} · ${eventRun.note}` : 'no run recorded');
   check('Event run produced a generation', Boolean(eventRun?.generation?.id));
+  check('The event run recorded its generate step', eventRun?.steps?.[0]?.action === 'generate' && eventRun.steps[0].status === 'succeeded', JSON.stringify(eventRun?.steps));
 
   // --- Scheduler -----------------------------------------------------------
   console.log('\nScheduler');
@@ -368,14 +417,176 @@ try {
   check('POST /api/automations accepts a schedule', heartbeat.body.automation?.schedule?.type === 'interval' && heartbeat.body.automation.nextRunAt);
   const scheduledRun = await waitUntil(async () => {
     const body = await owner.get(`/api/automations/${heartbeat.body.automation.id}/runs`);
-    return body.body.runs?.find((item) => String(item.note || '').startsWith('scheduled')) || null;
+    const found = body.body.runs?.find((item) => String(item.note || '').startsWith('scheduled'));
+    return found && found.status !== 'running' ? found : null;
   }, { timeoutMs: 8000 });
-  check('The scheduler runs due workflows on its own', scheduledRun?.status === 'succeeded', scheduledRun ? 'ok' : 'no scheduled run within 8s');
+  check('The scheduler runs due workflows on its own', scheduledRun?.status === 'succeeded', scheduledRun ? `${scheduledRun.status}` : 'no finished scheduled run within 8s');
   const scheduler = await owner.get('/api/scheduler');
   check('Scheduler status counts runs', scheduler.body.counts?.runs >= 1 && scheduler.body.active === true);
   check('Scheduler reports the workspace timezone', Boolean(scheduler.body.timeZone));
   const badSchedule = await owner.post('/api/automations', { name: 'Too fast', schedule: { type: 'interval', everyMinutes: 0.001 } });
   check('A nonsense schedule is rejected', badSchedule.status === 400);
+
+  // --- Automation steps ----------------------------------------------------
+  console.log('\nAutomation steps');
+
+  /** A local HTTP endpoint for webhook steps: records what it was sent. */
+  const receiver = { requests: [], behaviour: 'ok', server: null, url: '' };
+  receiver.server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* not JSON */ }
+      receiver.requests.push({ url: req.url, headers: req.headers, body: parsed, raw: Buffer.concat(chunks) });
+      const attempt = receiver.requests.length;
+      if (receiver.behaviour === 'fail-once' && attempt === 1) {
+        res.writeHead(500, { 'content-type': 'text/plain' });
+        return res.end('collector is warming up');
+      }
+      if (receiver.behaviour === 'reject') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end('{"error":"channel_not_found"}');
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end('{"ok":true}');
+    });
+  });
+  await new Promise((resolve) => receiver.server.listen(0, '127.0.0.1', resolve));
+  receiver.url = `http://127.0.0.1:${receiver.server.address().port}/hooks/studio`;
+
+  // Validation: a chain has to be a chain of things this server can run.
+  const unknownStep = await owner.post('/api/automations', { name: 'Nonsense', steps: [{ action: 'teleport' }], schedule: { type: 'manual' } });
+  check('An unknown step is rejected at creation', unknownStep.status === 400 && unknownStep.body.error?.code === 'invalid_steps', JSON.stringify(unknownStep.body).slice(0, 120));
+  const tooMany = await owner.post('/api/automations', {
+    name: 'Too long', schedule: { type: 'manual' },
+    steps: Array.from({ length: 6 }, () => ({ action: 'export' })),
+  });
+  check('A six-step chain is rejected', tooMany.status === 400, JSON.stringify(tooMany.body).slice(0, 120));
+  const noUrl = await owner.post('/api/automations', { name: 'No url', steps: [{ action: 'webhook' }], schedule: { type: 'manual' } });
+  check('A webhook step without a URL is rejected', noUrl.status === 400 && /URL/i.test(noUrl.body.error?.message || ''), JSON.stringify(noUrl.body).slice(0, 120));
+  const legacyAction = await owner.post('/api/automations', { name: 'Legacy shape', action: 'Prepare a creative brief', schedule: { type: 'manual' } });
+  check('The older action field still builds a chain', legacyAction.body.automation?.steps?.[0]?.action === 'generate', JSON.stringify(legacyAction.body.automation?.steps));
+  const catalog = (await owner.get('/api/automations')).body.stepCatalog || [];
+  check('The step catalogue is offered to the UI', catalog.length === 4 && catalog.find((entry) => entry.id === 'webhook')?.available === true, JSON.stringify(catalog.map((entry) => `${entry.id}:${entry.available}`)));
+
+  // A three-step chain: generate, export as zip, then post the summary.
+  receiver.behaviour = 'ok';
+  const chain = await owner.post('/api/automations', {
+    name: 'Brief, export, notify',
+    schedule: { type: 'manual' },
+    steps: [
+      { action: 'generate' },
+      { action: 'export', options: { format: 'zip' } },
+      { action: 'webhook', options: { url: receiver.url, event: 'studio.handoff' } },
+    ],
+  });
+  check('A three-step chain is stored', chain.body.automation?.steps?.length === 3, JSON.stringify(chain.body.automation?.steps));
+  const chainRun = await owner.post(`/api/automations/${chain.body.automation.id}/run`);
+  check('A three-step chain runs end to end', chainRun.body.status === 'succeeded' && chainRun.body.steps?.length === 3, JSON.stringify(chainRun.body.steps));
+  check('Every step records what it did', chainRun.body.steps?.every((step) => step.status === 'succeeded' && step.message) === true, JSON.stringify(chainRun.body.steps?.map((step) => step.message)));
+  check('The generate step produced a generation', Boolean(chainRun.body.steps?.[0]?.generationId));
+  check('The export step produced a file', Boolean(chainRun.body.steps?.[1]?.fileId) && chainRun.body.files?.length === 1, JSON.stringify(chainRun.body.files));
+
+  const exportedZip = await owner.request(`/api/files/${chainRun.body.steps[1].fileId}`, { raw: true });
+  const zipBuffer = Buffer.from(await exportedZip.arrayBuffer());
+  check('The zip export downloads as an archive', exportedZip.status === 200 && zipBuffer.slice(0, 2).toString() === 'PK', `${exportedZip.status} · ${zipBuffer.length} bytes`);
+  // Read the archive back through its own central directory, and check every
+  // entry's checksum — an export that only *looks* like a zip is not an export.
+  const zipEntries = readZipDirectory(zipBuffer);
+  check('The zip lists its entries', zipEntries.length >= 2 && zipEntries.some((entry) => entry.name === 'brief.md'), JSON.stringify(zipEntries.map((entry) => entry.name)));
+  check('Every zip entry matches its recorded checksum', zipEntries.every((entry) => crc32(entry.data) === entry.crc), JSON.stringify(zipEntries.map((entry) => `${entry.name}:${crc32(entry.data) === entry.crc}`)));
+  check('The zip keeps its folders', zipEntries.some((entry) => entry.name.startsWith('generations/')), JSON.stringify(zipEntries.map((entry) => entry.name)));
+  check('Zip entry names cannot escape the archive', archiveName('../../etc/passwd') === 'etc/passwd' && archiveName('/etc/shadow') === 'etc/shadow' && archiveName('..') === 'file', `${archiveName('../../etc/passwd')} · ${archiveName('/etc/shadow')}`);
+  const brief = zipEntries.find((entry) => entry.name === 'brief.md')?.data.toString('utf8') || '';
+  check('The exported brief describes the project', brief.includes('# ') && brief.includes('## Brief') && brief.length > 200, brief.slice(0, 60));
+
+  const webhookSent = receiver.requests.at(-1);
+  check('The webhook step posted a run summary', webhookSent?.body?.event === 'studio.handoff' && webhookSent.body.automation?.name === 'Brief, export, notify', JSON.stringify(webhookSent?.body).slice(0, 140));
+  check('The webhook payload carries the steps so far', Array.isArray(webhookSent?.body?.steps) && webhookSent.body.steps.length === 2, JSON.stringify(webhookSent?.body?.steps));
+  check('The webhook payload names the workspace', Boolean(webhookSent?.body?.workspace?.id && webhookSent.body.workspace.name), JSON.stringify(webhookSent?.body?.workspace));
+  check('The webhook identifies itself as this server', String(webhookSent?.headers?.['user-agent'] || '').includes('AI-Studio-OS'));
+
+  // A transient failure is retried with backoff; a rejection is not.
+  receiver.requests.length = 0; // count only this scenario's calls
+  receiver.behaviour = 'fail-once';
+  const flakyRun = await owner.post(`/api/automations/${chain.body.automation.id}/run`);
+  const flakyStep = flakyRun.body.steps?.at(-1);
+  check('A transient webhook failure is retried', flakyRun.body.status === 'succeeded' && flakyStep?.attempts === 2, JSON.stringify(flakyStep));
+  check('The retry reason is recorded on the step', /retried after/i.test(flakyStep?.message || ''), (flakyStep?.message || '').slice(0, 120));
+  check('The receiver really was called twice', receiver.requests.length === 2, `${receiver.requests.length} calls`);
+
+  receiver.requests.length = 0;
+  receiver.behaviour = 'reject';
+  const rejected = await owner.post(`/api/automations/${chain.body.automation.id}/run`);
+  const rejectedStep = rejected.body.steps?.at(-1) || {};
+  check('A rejected webhook fails the run', rejected.status === 502 && /400/.test(rejected.body.error?.message || ''), JSON.stringify(rejected.body.error).slice(0, 140));
+  check('A rejection is not retried', rejectedStep.attempts === 1 && receiver.requests.length === 1, `${rejectedStep.attempts} attempts, ${receiver.requests.length} calls`);
+  check('A failed run stops the chain instead of continuing', /failed/i.test(rejected.body.error?.message || ''));
+  receiver.behaviour = 'ok';
+
+  // Tidy: archive finished work, or say honestly that there is nothing to do.
+  const tidy = await owner.post('/api/automations', {
+    name: 'Tidy finished work',
+    schedule: { type: 'manual' },
+    steps: [{ action: 'tidy', options: { afterDays: 1, statuses: ['Completed'] } }],
+  });
+  const tidyRun = await owner.post(`/api/automations/${tidy.body.automation.id}/run`);
+  check('A tidy step archives finished work', tidyRun.body.status === 'succeeded' && /Archived 1 project/.test(tidyRun.body.message), tidyRun.body.message);
+  const projectsAfterTidy = (await owner.get('/api/projects')).body.projects.map((project) => project.title);
+  check('The archived project left the active list', !projectsAfterTidy.includes('Soundscape for slow mornings') && projectsAfterTidy.includes('Aurora — skincare launch film'), JSON.stringify(projectsAfterTidy).slice(0, 160));
+  const dryRun = await owner.post('/api/automations', {
+    name: 'Tidy rehearsal',
+    schedule: { type: 'manual' },
+    steps: [{ action: 'tidy', options: { afterDays: 1, statuses: ['Completed'], dryRun: true } }],
+  });
+  const dryRunResult = await owner.post(`/api/automations/${dryRun.body.automation.id}/run`);
+  check('A tidy step with nothing left says so', ['skipped', 'succeeded'].includes(dryRunResult.body.status) && /nothing to tidy|would archive/i.test(dryRunResult.body.message), dryRunResult.body.message);
+
+  // Per-automation time zone: 9am means 9am in Kolkata, not on the server.
+  const zoned = await owner.post('/api/automations', { name: 'Kolkata digest', schedule: { type: 'daily', time: '09:00' }, timeZone: 'Asia/Kolkata', action: 'Curate & summarize' });
+  const zonedHour = zoned.body.automation?.nextRunAt
+    ? Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }).format(new Date(zoned.body.automation.nextRunAt)))
+    : -1;
+  check('An automation can carry its own time zone', zoned.body.automation?.timeZone === 'Asia/Kolkata' && zonedHour === 9, `${zoned.body.automation?.timeZone} · hour ${zonedHour} · ${zoned.body.automation?.nextRunAt}`);
+  const rezoned = await owner.patch(`/api/automations/${zoned.body.automation.id}`, { timeZone: 'Europe/Berlin' });
+  check('The time zone can be changed later', rezoned.body.automation?.timeZone === 'Europe/Berlin', rezoned.body.automation?.timeZone);
+  check('Changing the zone moves the next run', rezoned.body.automation?.nextRunAt !== zoned.body.automation?.nextRunAt);
+
+  // The run log: every run in the workspace, with its steps.
+  const log = await owner.get('/api/automation-runs?limit=20');
+  check('The run log lists recent runs across workflows', log.body.runs?.length >= 4 && log.body.runs.every((item) => item.automationName), JSON.stringify(log.body.runs?.map((item) => item.automationName)).slice(0, 120));
+  check('A logged run carries its steps', log.body.runs.some((item) => item.steps?.length === 3));
+  check('The run log shows why a run failed', log.body.runs.some((item) => item.status === 'failed' && /400/.test(item.failedStep?.message || '')), JSON.stringify(log.body.runs.find((item) => item.status === 'failed')?.failedStep?.message));
+  check('A finished run reports its duration', log.body.runs.filter((item) => item.status === 'succeeded').every((item) => Number.isFinite(item.durationMs)));
+
+  // Retry classification, pinned so a change in wording cannot silently
+  // turn every failure into a retry (or none into one).
+  check('A rate limit is worth retrying', isTransient({ status: 429, message: 'slow down' }) && isTransient({ message: 'socket hang up' }) && isTransient({ retryable: true, message: 'nope' }));
+  check('A bad request is not', !isTransient({ status: 400, message: 'bad prompt' }) && !isTransient({ status: 401, message: 'no key' }));
+  check('Steps are normalised from the old action names', normalizeSteps({ action: 'Organize projects' }).steps[0]?.action === 'tidy' && normalizeSteps({ action: 'Curate & summarize' }).steps[0]?.action === 'generate');
+
+  // The webhook guard, with DNS stubbed so the test is hermetic.
+  const publicLookup = async () => [{ address: '93.184.216.34' }];
+  const internalLookup = async () => [{ address: '10.4.0.9' }];
+  const guarded = createWebhookSender({ allow: ['*.example.com'], lookup: publicLookup });
+  const internal = createWebhookSender({ allow: ['*.example.com'], lookup: internalLookup });
+  const exact = createWebhookSender({ allow: ['127.0.0.1'], lookup: publicLookup });
+  const none = createWebhookSender({ allow: [] });
+  const allowed = await guarded.assert('https://hooks.example.com/x').then(() => true).catch(() => false);
+  const refusedInternal = await internal.assert('https://hooks.example.com/x').then(() => null).catch((error) => error.code);
+  const refusedMetadata = await none.assert('http://169.254.169.254/latest/meta-data/').then(() => null).catch((error) => error.code);
+  const refusedOffList = await guarded.assert('https://evil.test/x').then(() => null).catch((error) => error.code);
+  const refusedScheme = await guarded.assert('file:///etc/passwd').then(() => null).catch((error) => error.code);
+  check('An allowed public host passes the guard', allowed);
+  check('A wildcard may not reach a private address', refusedInternal === 'webhook_private_address', String(refusedInternal));
+  check('Metadata addresses are refused when webhooks are off', refusedMetadata === 'webhook_disabled', String(refusedMetadata));
+  check('A host that is not allow-listed is refused', refusedOffList === 'webhook_not_allowed', String(refusedOffList));
+  check('Only http and https are allowed', refusedScheme === 'webhook_protocol', String(refusedScheme));
+  check('An exact allow-list entry may be local', await exact.assert('http://127.0.0.1:9000/hook').then(() => true).catch(() => false));
+  check('Private ranges are recognised', privateReason('10.0.0.1') && privateReason('192.168.1.5') && privateReason('::1') && !privateReason('93.184.216.34'));
+
+  await new Promise((resolve) => receiver.server.close(resolve));
 
   // --- Teams, roles, invites ----------------------------------------------
   console.log('\nTeams and roles');

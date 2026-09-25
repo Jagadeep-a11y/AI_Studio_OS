@@ -54,11 +54,12 @@ another host is refused with `code: "cross_origin"`. Non-browser clients (curl, 
 | `GET /api/generations/:id` | A single generation record plus its files |
 | `GET /api/prompts` · `POST /api/prompts` | Prompt library |
 | `POST /api/prompts/:id/use` | Increment a prompt's use count |
-| `GET /api/automations` | Workflows (`?runs=1` includes each one's recent runs) |
-| `POST /api/automations` | Create a workflow, with a schedule |
-| `PATCH /api/automations/:id` | Pause, enable, edit, or reschedule |
-| `POST /api/automations/:id/run` | Run now (real generation for generator steps) |
-| `GET /api/automations/:id/runs` | Run history (`?limit=`) |
+| `GET /api/automations` | Workflows (`?runs=1` includes each one's recent runs), plus the step catalogue |
+| `POST /api/automations` | Create a workflow from a step chain and a schedule |
+| `PATCH /api/automations/:id` | Pause, enable, re-chain, retime, or reschedule |
+| `POST /api/automations/:id/run` | Run now (`run` capability) |
+| `GET /api/automations/:id/runs` | Run history with per-step detail (`?limit=`) |
+| `GET /api/automation-runs` | The workspace run log, newest first (`?limit=` up to 100) |
 | `GET /api/scheduler` | Scheduler health: enabled, tick, counts, next automation |
 | `POST /api/files` | **Upload reference files** (multipart) |
 | `GET /api/files` | Stored files (`?projectId=`, `?limit=`) |
@@ -269,19 +270,116 @@ refused us" is a finding rather than a server fault:
 
 ---
 
+## Automation steps
+
+An automation is a chain of up to five steps, run in order. `action` is still accepted as shorthand
+for a one-step chain, so older clients keep working.
+
+| Step | Options | What it does |
+| --- | --- | --- |
+| `generate` | `prompt` (optional) | Runs a model through the gateway and keeps the output on the project. Without an explicit prompt it uses the automation's own template |
+| `export` | `format` (`markdown` or `zip`) | Writes the project out as a stored file: a Markdown brief, or a zip of the brief, every generation, and every reference file |
+| `tidy` | `afterDays` (1–3650, default 60), `statuses` (default `Completed`/`Complete`/`Published`), `dryRun` | Archives projects in those statuses that have not been touched for that long. At most ten per run |
+| `webhook` | `url` (required), `event` (default `automation.run`) | POSTs a JSON run summary to a host the server is allowed to call |
+
+```bash
+curl -s -b cookies.txt -X POST localhost:4173/api/automations \
+  -H 'content-type: application/json' -d '{
+    "name": "Friday handoff",
+    "schedule": { "type": "daily", "time": "16:00", "daysOfWeek": [5] },
+    "timeZone": "Asia/Kolkata",
+    "steps": [
+      { "action": "generate" },
+      { "action": "export", "options": { "format": "zip" } },
+      { "action": "webhook", "options": { "url": "https://hooks.example.com/studio", "event": "studio.handoff" } }
+    ]
+  }'
+```
+
+A step that fails stops the chain; the steps after it are recorded as `skipped`, so a run is never
+half-attributed. Transient failures — a rate limit, a 5xx, a timeout, a dropped connection — are
+retried up to twice more with exponential backoff (400ms, 800ms), and the step reports how many
+attempts it took. A step is only retried when retrying could work: a 4xx from a webhook receiver or
+a rejected payload is never posted twice.
+
+`POST`/`PATCH` reject an unknown step, an empty chain, more than five steps, a webhook step without a
+URL, and a webhook step on a server that has no allow list, all with `400 invalid_steps` or
+`400 webhook_disabled`.
+
+### Time zones
+
+`timeZone` (IANA name) sets the clock this automation's schedule means. A Monday 09:00 digest in a
+workspace whose members are in Bengaluru should fire at 09:00 IST even when the server runs in
+another region, so the automation's zone wins over the workspace default.
+
 ## `POST /api/automations/:id/run`
 
-Runs an automation's mapped generator step through the gateway and records the run.
+Runs the chain and records it. Every step's outcome comes back, so a caller can show where a run
+went without a second request.
 
 ```json
-{ "status": "succeeded", "output": "…generated text…", "isDemo": true,
-  "automation": { "id": "a-digest", "lastRun": "2026-09-24T…" },
+{ "status": "succeeded", "message": "“Friday handoff” finished 3 steps — Generated 812 characters…",
+  "isDemo": true, "output": "…generated text…",
+  "steps": [
+    { "index": 0, "action": "generate", "status": "succeeded", "message": "Generated 812 characters with Claude Sonnet", "ms": 402, "attempts": 1, "generationId": "g-…" },
+    { "index": 1, "action": "export", "status": "succeeded", "message": "Exported “Atlas — a weekend in Lisbon” as atlas-a-weekend-in-lisbon.zip (14 entries)", "ms": 9, "fileId": "f-…" },
+    { "index": 2, "action": "webhook", "status": "succeeded", "message": "Posted the run summary to hooks.example.com (200 in 41ms)", "ms": 41 }
+  ],
+  "files": [{ "id": "f-…", "name": "atlas-a-weekend-in-lisbon.zip", "size": 482911, "url": "/api/files/f-…" }],
   "generation": { "id": "g-…", "credits": 1 } }
 ```
 
-Automations whose action is a workspace chore rather than a generation reply
-`{ "status": "skipped", "message": "…" }` — nothing is written, and the run is still recorded so
-the history does not quietly lose it.
+A run where every step had nothing to do answers `200 { "status": "skipped", "message": "…" }` — for
+example a tidy step with no finished projects. A failed step answers `502 automation_failed` with the
+failing step's message and hint.
+
+### The run log
+
+`GET /api/automation-runs?limit=25` returns recent runs across the whole workspace, newest first:
+
+```json
+{ "runs": [ { "id": "run-…", "automationId": "a-…", "automationName": "Friday handoff",
+              "status": "failed", "createdLabel": "4 minutes ago", "durationMs": 512,
+              "steps": [ { "position": 0, "action": "generate", "status": "succeeded", "message": "…", "ms": 498, "attempts": 2 } ],
+              "failedStep": { "action": "webhook", "message": "Webhook answered 404: channel_not_found" } } ],
+  "stats": { "total": 12, "recent": 4, "lastRunAt": "2026-09-25T…" } }
+```
+
+A run is written when it starts and updated when it ends, so a run in flight is visible as
+`running`; one left behind by a process that died is reported as `interrupted` after fifteen
+minutes rather than pretending it is still going.
+
+## Webhooks
+
+The `webhook` step posts this payload:
+
+```json
+{ "event": "studio.handoff", "generatedAt": "2026-09-25T04:31:02.114Z",
+  "workspace": { "id": "w-…", "name": "Northstar Studio" },
+  "automation": { "id": "a-…", "name": "Friday handoff", "source": "scheduled" },
+  "runId": "run-…",
+  "project": { "id": "p-…", "title": "Atlas — a weekend in Lisbon", "status": "In review", "outputs": 11 },
+  "steps": [ { "action": "generate", "status": "succeeded", "message": "Generated 812 characters…" } ],
+  "files": [ { "id": "f-…", "name": "…zip", "size": 482911, "url": "/api/files/f-…" } ] }
+```
+
+`steps` are the steps that ran *before* this one — a webhook step is the end of the chain, so it
+reports what the chain did rather than itself. The request carries `x-studio-event` and a
+`user-agent` naming this server, follows no redirects, and times out after
+`AI_STUDIO_WEBHOOK_TIMEOUT_MS` (10s).
+
+Outbound webhooks are **off until an operator allows a host**:
+
+```bash
+AI_STUDIO_WEBHOOK_ALLOW=hooks.slack.com,discord.com,*.example.com
+```
+
+- an exact entry may point anywhere, including `127.0.0.1` — that is an operator naming a target;
+- a `*.suffix` wildcard may not resolve to a private, loopback, or link-local address, so a wildcard
+  cannot be used to reach the network the server sits on;
+- `http` and `https` only, and redirects are refused;
+- when the list is empty the step is refused at creation *and* at run time, and the UI does not
+  offer it.
 
 ### Schedules
 
@@ -296,7 +394,8 @@ the history does not quietly lose it.
 | `event` | `{ "type": "event", "event": "project.status", "value": "In review" }` | Whenever a project is marked “In review” |
 | `manual` | `{ "type": "manual" }` | Only when someone presses Run |
 
-`time` is a wall-clock time in the workspace timezone (`GET /api/settings` → `timezone`). Automation
+`time` is a wall-clock time in the automation's own `timeZone`, falling back to the workspace
+timezone (`GET /api/settings` → `timezone`). Automation
 rows carry `nextRunAt`, `nextRunLabel`, `triggerLabel`, `lastStatus`, and `lastRun`, so a client can
 render the schedule without knowing the schedule rules. A manual run moves `nextRunAt` forward, so
 pressing Run never causes a duplicate run minutes later.

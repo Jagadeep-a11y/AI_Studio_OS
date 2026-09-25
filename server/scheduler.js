@@ -47,7 +47,9 @@ export function createScheduler({ store, accounts, runner, config, logger = cons
 
   async function runOne(data, automation, dueAt) {
     // Claim the window first: if anything below throws, the schedule still moved.
-    const timeZone = () => data.getSettings().timezone || 'UTC';
+    // A daily or weekly schedule means wall-clock time where the studio is, so
+    // the automation's own zone wins; a workspace zone is the fallback.
+    const timeZone = () => automation.timeZone || data.getSettings().timezone || 'UTC';
 
     data.setNextRun(automation.id, isoOf(Date.now() + backoffMs));
     state.running = true;
@@ -62,7 +64,7 @@ export function createScheduler({ store, accounts, runner, config, logger = cons
         state.failures += 1;
         logger.warn(`⟳ “${automation.name}” failed after ${finishedAt - started}ms: ${result.message}`);
       } else if (result.status === 'skipped') {
-        logger.log(`⟳ “${automation.name}” skipped (no generator step)`);
+        logger.log(`⟳ “${automation.name}” skipped (every step had nothing to do)`);
       } else {
         state.runs += 1;
         logger.log(`⟳ “${automation.name}” ran in ${finishedAt - started}ms${result.isDemo ? ' (demo engine)' : ''}`);

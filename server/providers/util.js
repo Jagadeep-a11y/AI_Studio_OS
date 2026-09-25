@@ -8,13 +8,20 @@
  */
 
 export class ProviderError extends Error {
-  constructor(message, { provider, status = 502, code = 'provider_error', hint = '' } = {}) {
+  /**
+   * `retryable` is optional on purpose: when it is set, the layer that raised
+   * the error is saying whether trying again could work (a rate limit) or cannot
+   * (a rejected payload). Callers that retry should trust it over any guess
+   * they would otherwise make from the status code.
+   */
+  constructor(message, { provider, status = 502, code = 'provider_error', hint = '', retryable = null } = {}) {
     super(message);
     this.name = 'ProviderError';
     this.provider = provider;
     this.status = status;
     this.code = code;
     this.hint = hint;
+    if (retryable !== null) this.retryable = Boolean(retryable);
   }
 }
 

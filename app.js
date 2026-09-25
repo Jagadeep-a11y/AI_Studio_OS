@@ -200,6 +200,10 @@
     settingsTab: 'Profile',
     notificationsRead: false,
     session: { user: null, role: null, canWrite: false, canManage: false, workspaces: [], members: [], invites: [], assignableRoles: [] },
+    stepCatalog: null,     // which automation steps this server can run
+    stepDraft: [],         // the step chain being edited in the modal
+    runLog: [],            // recent runs across every workflow
+    openRuns: {},          // run id → expanded in the run log
     storage: null,         // live storage driver description and usage
     storageCheck: null,    // result of the last "test the bucket" run
     auth: { mode: 'signin', firstRun: false, claimable: [], signupsOpen: true, invite: null, inviteToken: '', error: '', busy: false },
@@ -769,9 +773,14 @@
     if (!force && state.automationRunsFetchedAt && Date.now() - state.automationRunsFetchedAt < 4000) return;
     state.automationRunsLoading = true;
     try {
-      const payload = await api.request('/api/automations?runs=1');
+      const [payload, log] = await Promise.all([
+        api.request('/api/automations?runs=1'),
+        api.request('/api/automation-runs?limit=25').catch(() => null),
+      ]);
       state.automations = payload.automations;
       if (payload.stats) state.automationStats = payload.stats;
+      if (payload.stepCatalog) state.stepCatalog = payload.stepCatalog;
+      if (log?.runs) state.runLog = log.runs;
       state.automationRunsFetchedAt = Date.now();
       if (payload.scheduler) state.scheduler = payload.scheduler;
       if (state.page === 'automations') {
@@ -807,10 +816,76 @@
   }
 
   /** Last few runs of a workflow, straight from the server's run history. */
+  const STEP_LABELS = { generate: 'Generate', export: 'Export', tidy: 'Tidy', webhook: 'Webhook' };
+  const stepLabel = (action) => STEP_LABELS[action] || String(action || 'Step');
+
+  /** The steps this server can run, in catalogue order, for the builder. */
+  function stepCatalog() {
+    return state.stepCatalog?.length ? state.stepCatalog : [
+      { id: 'generate', label: 'Generate', blurb: 'Run a model and keep the output on the project.', available: true },
+      { id: 'export', label: 'Export', blurb: 'Write the project out as Markdown, or as a zip with its files.', available: true },
+      { id: 'tidy', label: 'Tidy projects', blurb: 'Archive the projects that finished long enough ago to be history.', available: true },
+      { id: 'webhook', label: 'Webhook', blurb: 'POST a JSON run summary to an allowed host.', available: false },
+    ];
+  }
+
+  /**
+   * An automation is a chain, so the chain is what the row shows: what it will
+   * do, in order, before you press run.
+   */
+  function stepChainHTML(automation) {
+    const steps = automation.steps?.length ? automation.steps : [{ action: automation.action }];
+    return `<div class="step-chain">${steps.map((step, index) => `${index ? '<span class="step-arrow">→</span>' : ''}<span class="step-pill" title="${escapeHTML(stepOptionsSummary(step))}">${escapeHTML(stepLabel(step.action))}${stepOptionsSummary(step) ? `<small>${escapeHTML(stepOptionsSummary(step))}</small>` : ''}</span>`).join('')}</div>`;
+  }
+
+  /** The short parenthetical that makes "Export" mean "Export as zip". */
+  function stepOptionsSummary(step) {
+    const options = step?.options || {};
+    if (step?.action === 'export') return options.format === 'zip' ? 'zip' : 'markdown';
+    if (step?.action === 'tidy') return options.afterDays ? `${options.afterDays}d` : '60d';
+    if (step?.action === 'webhook') return options.event || 'run summary';
+    return '';
+  }
+
+  function runStatusWord(status) {
+    return { succeeded: 'Ran', failed: 'Failed', skipped: 'Skipped', running: 'Running', interrupted: 'Interrupted' }[status] || status;
+  }
+
+  const stepStatusIcon = (status) => (status === 'succeeded' ? 'check' : status === 'failed' ? 'close' : 'clock');
+
+  function runStepsHTML(run) {
+    const steps = run.steps || [];
+    if (!steps.length) return '';
+    return `<div class="run-steps">${steps.map((step) => `<div class="run-step is-${escapeHTML(step.status)}"><span class="status-dot ${escapeHTML(step.status)}"></span><strong>${escapeHTML(stepLabel(step.action))}</strong><span class="run-step-message">${escapeHTML(step.message || '')}</span><span class="run-step-time">${step.ms ? `${step.ms}ms` : ''}${step.attempts > 1 ? ` · ${step.attempts} attempts` : ''}</span></div>`).join('')}</div>`;
+  }
+
   function automationRunsHTML(automation) {
     const runs = automation.runs || [];
+    if (!runs.length) return '<div class="automation-runs is-empty">Not run yet.</div>';
+    return `<div class="automation-runs">${runs.map((run) => `<div class="automation-run"><span class="status-dot ${escapeHTML(run.status)}"></span><span class="automation-run-head">${escapeHTML(runStatusWord(run.status))} ${escapeHTML(run.createdLabel || '')}${run.durationMs ? ` · ${escapeHTML(String(run.durationMs))}ms` : ''}</span>${run.failedStep ? `<span class="automation-run-why">stopped at ${escapeHTML(stepLabel(run.failedStep.action))}: ${escapeHTML((run.failedStep.message || '').slice(0, 90))}</span>` : ''}${runStepsHTML(run)}</div>`).join('')}</div>`;
+  }
+
+  /**
+   * The run log: every run in the workspace, expandable to its steps. This is
+   * the answer to "did the 3am workflow work?" without opening a terminal.
+   */
+  function runLogHTML() {
+    const runs = state.runLog || [];
     if (!runs.length) return '';
-    return `<div class="automation-runs">${runs.map((run) => `<div class="automation-run"><span class="status-dot ${escapeHTML(run.status)}"></span><span>${escapeHTML(run.status === 'succeeded' ? 'Ran' : run.status === 'failed' ? 'Failed' : 'Skipped')} ${escapeHTML(run.createdLabel || '')}</span><span>${escapeHTML((run.note || '').slice(0, 54))}</span></div>`).join('')}</div>`;
+    return `<div class="section-head" style="margin-top:22px"><div><h2>Run log</h2><p class="section-subtitle">Every run across this workspace, newest first. Open one to see each step.</p></div></div>
+      <div class="run-log">${runs.map((run) => {
+        const open = Boolean(state.openRuns[run.id]);
+        return `<article class="run-log-row${open ? ' is-open' : ''}">
+        <button type="button" class="run-log-head" data-action="toggle-run" data-id="${escapeHTML(run.id)}" aria-expanded="${open}">
+          <span class="status-dot ${escapeHTML(run.status)}"></span>
+          <span class="run-log-name">${escapeHTML(run.automationName || 'Workflow')}</span>
+          <span class="run-log-when">${escapeHTML(run.createdLabel || '')}</span>
+          <span class="run-log-meta">${escapeHTML(runStatusWord(run.status))}${run.steps?.length ? ` · ${run.steps.length} step${run.steps.length === 1 ? '' : 's'}` : ''}${Number.isFinite(run.durationMs) && run.durationMs ? ` · ${escapeHTML(String(run.durationMs))}ms` : ''}</span>
+          <span class="run-log-chevron">${open ? '−' : '+'}</span>
+        </button>
+        ${open ? `${runStepsHTML(run)}<p class="run-log-note">${escapeHTML(run.note || '')}</p>` : (run.failedStep ? `<p class="run-log-why">stopped at ${escapeHTML(stepLabel(run.failedStep.action))}: ${escapeHTML((run.failedStep.message || '').slice(0, 120))}</p>` : '')}
+      </article>`;
+      }).join('')}</div>`;
   }
 
   function schedulerHeadline() {
@@ -831,7 +906,7 @@
     return `<section class="page-heading"><div><div class="eyebrow">Let the small things run themselves</div><h1>Automations</h1><p>Make repeatable creative work feel a little less repetitive.</p></div><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></section>
       <section class="metrics-grid" aria-label="Automation summary"><article class="metric-card"><div class="metric-topline"><span>Active automations</span><span class="metric-icon">${icon('workflow')}</span></div><div class="metric-main"><strong class="metric-value">${state.automations.filter((automation) => automation.enabled).length}</strong><span class="metric-meta">out of ${state.automations.length} workflows</span></div></article><article class="metric-card"><div class="metric-topline"><span>Runs this month</span><span class="metric-icon green">${icon('refresh')}</span></div><div class="metric-main"><strong class="metric-value">${escapeHTML(String(state.automationStats?.recent ?? 0))}</strong><span class="metric-meta">${escapeHTML(state.automationStats?.total ? `${state.automationStats.total} recorded in total` : 'no runs recorded yet')}</span></div></article><article class="metric-card"><div class="metric-topline"><span>The scheduler</span><span class="metric-icon peach">${icon('clock')}</span></div><div class="metric-main"><strong class="metric-value">${escapeHTML(schedulerHeadline())}</strong><span class="metric-meta">${escapeHTML(schedulerDetail())}</span></div></article></section>
       <div class="section-head"><div><h2>Your workflows</h2><p class="section-subtitle">Pause, run, or refine a workflow any time.</p></div><button class="text-link" type="button" data-action="automation-templates">Browse templates ${icon('arrow-right')}</button></div>
-      <div class="automation-list">${state.automations.map((automation) => `<article class="automation-row"><span class="automation-icon ${escapeHTML(automation.tone || '')}">${icon('workflow')}</span><div class="automation-main"><h3>${escapeHTML(automation.name)}</h3><p>${escapeHTML(automation.description)}</p>${automationRunsHTML(automation)}</div><span class="automation-meta">${escapeHTML(automation.trigger || automation.triggerLabel || 'On demand')}${automation.nextRunLabel ? `<span class="automation-schedule">Next run ${escapeHTML(automation.nextRunLabel)}</span>` : (automation.schedule?.type === 'event' ? '<span class="automation-schedule">Runs when the event fires</span>' : '')}</span><button type="button" class="quiet-button" data-action="run-automation" data-id="${escapeHTML(automation.id)}" aria-label="Run ${escapeHTML(automation.name)} now">${icon('play')}</button><button type="button" class="toggle" role="switch" aria-checked="${Boolean(automation.enabled)}" aria-label="${automation.enabled ? 'Pause' : 'Enable'} ${escapeHTML(automation.name)}" data-action="toggle-automation" data-id="${escapeHTML(automation.id)}"></button></article>`).join('') || `<div class="empty-state"><div><span class="empty-state-icon">${icon('workflow')}</span><h2>No workflows yet</h2><p>Create your first automation to take a repeatable task off your hands.</p><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></div></div>`}</div>`;
+      <div class="automation-list">${state.automations.map((automation) => `<article class="automation-row"><span class="automation-icon ${escapeHTML(automation.tone || '')}">${icon('workflow')}</span><div class="automation-main"><h3>${escapeHTML(automation.name)}</h3><p>${escapeHTML(automation.description)}</p>${stepChainHTML(automation)}${automationRunsHTML(automation)}</div><span class="automation-meta">${escapeHTML(automation.trigger || automation.triggerLabel || 'On demand')}${automation.nextRunLabel ? `<span class="automation-schedule">Next run ${escapeHTML(automation.nextRunLabel)}</span>` : (automation.schedule?.type === 'event' ? '<span class="automation-schedule">Runs when the event fires</span>' : '')}</span><button type="button" class="quiet-button" data-action="run-automation" data-id="${escapeHTML(automation.id)}" aria-label="Run ${escapeHTML(automation.name)} now">${icon('play')}</button><button type="button" class="toggle" role="switch" aria-checked="${Boolean(automation.enabled)}" aria-label="${automation.enabled ? 'Pause' : 'Enable'} ${escapeHTML(automation.name)}" data-action="toggle-automation" data-id="${escapeHTML(automation.id)}"></button></article>`).join('') || `<div class="empty-state"><div><span class="empty-state-icon">${icon('workflow')}</span><h2>No workflows yet</h2><p>Create your first automation to take a repeatable task off your hands.</p><button class="primary-button" type="button" data-action="new-automation">${icon('plus')} New automation</button></div></div>`}</div>${runLogHTML()}`;
   }
 
   /**
@@ -1325,14 +1400,67 @@
     showToast(`“${project.title}” was removed from this workspace.`);
   }
 
+  /**
+   * The step builder. A chain is edited as rows: a kind, its own options, and
+   * the ability to add or drop a step. The draft lives in `state.stepDraft` so
+   * re-rendering on add/remove does not lose what was typed.
+   */
+  function stepDraftHTML() {
+    const catalog = stepCatalog();
+    return state.stepDraft.map((step, index) => {
+      const kind = step.action;
+      const options = step.options || {};
+      const detail = kind === 'generate'
+        ? `<input type="text" data-step-option="prompt" data-index="${index}" value="${escapeHTML(options.prompt || '')}" placeholder="Leave blank to use the workflow's prompt" aria-label="Step ${index + 1} prompt" />`
+        : kind === 'export'
+          ? `<select data-step-option="format" data-index="${index}" aria-label="Step ${index + 1} export format"><option value="markdown"${options.format !== 'zip' ? ' selected' : ''}>Markdown brief</option><option value="zip"${options.format === 'zip' ? ' selected' : ''}>Zip with files</option></select>`
+          : kind === 'tidy'
+            ? `<label class="step-inline">Archive finished projects older than <input type="number" min="1" max="3650" data-step-option="afterDays" data-index="${index}" value="${escapeHTML(String(options.afterDays || 60))}" aria-label="Step ${index + 1} days" /> days</label>`
+            : `<input type="url" data-step-option="url" data-index="${index}" value="${escapeHTML(options.url || '')}" placeholder="https://hooks.example.com/studio" aria-label="Step ${index + 1} webhook URL" />`;
+      return `<div class="step-row" data-step-row="${index}">
+        <span class="step-number">${index + 1}</span>
+        <div class="step-body">
+          <select data-step-kind="${index}" aria-label="Step ${index + 1} kind">${catalog.map((entry) => `<option value="${escapeHTML(entry.id)}"${entry.id === kind ? ' selected' : ''}${entry.available === false ? ' disabled' : ''}>${escapeHTML(entry.label)}${entry.available === false ? ' (needs a server allow list)' : ''}</option>`).join('')}</select>
+          <div class="step-detail">${detail}</div>
+          <p class="step-blurb">${escapeHTML(catalog.find((entry) => entry.id === kind)?.blurb || '')}</p>
+        </div>
+        ${state.stepDraft.length > 1 ? `<button type="button" class="step-remove" data-action="remove-step" data-index="${index}" aria-label="Remove step ${index + 1}">${icon('close')}</button>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  /** Reads what is in the builder back into the draft, then re-renders. */
+  function syncStepDraft() {
+    const rows = document.querySelectorAll('[data-step-row]');
+    state.stepDraft = [...rows].map((row) => {
+      const kind = row.querySelector('[data-step-kind]')?.value || 'generate';
+      const options = {};
+      for (const field of row.querySelectorAll('[data-step-option]')) {
+        const value = String(field.value || '').trim();
+        if (value) options[field.dataset.stepOption] = field.dataset.stepOption === 'afterDays' ? Number(value) || 60 : value;
+      }
+      return { action: kind, options };
+    });
+    return state.stepDraft;
+  }
+
+  function rerenderStepDraft() {
+    const container = document.getElementById('automation-steps');
+    if (container) container.innerHTML = stepDraftHTML();
+  }
+
   function openNewAutomationModal() {
+    // The draft is seeded before the markup is built, so the builder renders
+    // with a first step already in it.
+    state.stepDraft = [{ action: 'generate', options: {} }];
+    state.openRuns = {};
     openModal(`<div class="modal-scrim" data-scrim="true"><section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="automation-modal-title"><div class="modal-header"><div><h2 id="automation-modal-title">Create an automation</h2><p>Start with one small, repeatable thing.</p></div><button class="modal-close" type="button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></div><form id="automation-form"><div class="modal-body"><div class="form-field"><label for="automation-name">Automation name</label><input id="automation-name" name="name" placeholder="e.g. Share a Friday round-up" required maxlength="60" /></div><div class="form-field"><label for="automation-kind">When should it run?</label><select name="kind" id="automation-kind" data-schedule-kind><option value="daily">Every day at a set time</option><option value="weekly">Every week on a set day</option><option value="monthly">Every month on a set date</option><option value="interval">On a repeating interval</option><option value="event">When something happens in the studio</option><option value="manual">Only when I press run</option></select>
             <div class="schedule-fields" data-schedule-fields="daily weekly monthly"><label for="automation-time">Time of day</label><input type="time" id="automation-time" name="time" value="09:00" /></div>
             <div class="schedule-fields" data-schedule-fields="weekly"><label for="automation-weekday">Day of week</label><select id="automation-weekday" name="weekday"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></div>
             <div class="schedule-fields" data-schedule-fields="monthly"><label for="automation-day">Day of month</label><input type="number" id="automation-day" name="day" min="1" max="28" value="1" /></div>
             <div class="schedule-fields" data-schedule-fields="interval"><label for="automation-every">Every (minutes)</label><input type="number" id="automation-every" name="everyMinutes" min="1" max="43200" value="60" /></div>
             <div class="schedule-fields" data-schedule-fields="event"><label for="automation-event">Event</label><select id="automation-event" name="event"><option value="project.status:In review">A project is marked “In review”</option><option value="project.status:Published">A project is marked “Published”</option><option value="project.status:Complete">A project is marked “Complete”</option></select></div>
-            <span class="modal-note">Times use the workspace timezone (${escapeHTML(state.settings.timezone || 'UTC')}).</span></div><div class="form-field"><label for="automation-action">What should it do?</label><select name="action" id="automation-action"><option>Curate & summarize</option><option>Draft a handoff</option><option>Organize projects</option><option>Prepare a creative brief</option></select></div><div class="form-field"><label for="automation-description">A note for future you <span style="color:#a6a4b0;font-weight:400">(optional)</span></label><textarea name="description" id="automation-description" placeholder="What should this workflow take care of?"></textarea></div></div><div class="modal-footer"><span class="modal-note">Scheduled workflows run on the server, even when this tab is closed.</span><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create automation ${icon('arrow-right')}</button></div></form></section></div>`, 'new-automation', { focus: '#automation-name' });
+            <span class="modal-note">Times use the workspace timezone (${escapeHTML(state.settings.timezone || 'UTC')}).</span></div><div class="form-field"><label for="automation-timezone">Time zone</label><select name="timeZone" id="automation-timezone"><option value="">Use the workspace time zone (${escapeHTML(state.settings.timezone || 'UTC')})</option><option value="UTC">UTC</option><option value="Asia/Kolkata">Asia/Kolkata</option><option value="Asia/Singapore">Asia/Singapore</option><option value="Asia/Tokyo">Asia/Tokyo</option><option value="Europe/London">Europe/London</option><option value="Europe/Berlin">Europe/Berlin</option><option value="America/New_York">America/New_York</option><option value="America/Los_Angeles">America/Los_Angeles</option><option value="Australia/Sydney">Australia/Sydney</option></select><span class="modal-note">A daily time means that time where the studio is, not where the server runs.</span></div><div class="form-field"><label>What should it do?</label><div class="step-builder" id="automation-steps">${stepDraftHTML()}</div><div class="step-builder-actions"><button type="button" class="text-link" data-action="add-step">${icon('plus')} Add a step</button><span class="modal-note">Steps run in order. If one fails, the rest are skipped and the run says where it stopped.</span></div></div><div class="form-field"><label for="automation-description">A note for future you <span style="color:#a6a4b0;font-weight:400">(optional)</span></label><textarea name="description" id="automation-description" placeholder="What should this workflow take care of?"></textarea></div></div><div class="modal-footer"><span class="modal-note">Scheduled workflows run on the server, even when this tab is closed.</span><button class="secondary-button" type="button" data-action="close-modal">Cancel</button><button class="primary-button" type="submit">Create automation ${icon('arrow-right')}</button></div></form></section></div>`, 'new-automation', { focus: '#automation-name' });
     syncScheduleFields(document);
   }
 
@@ -1854,9 +1982,16 @@
       renderPage();
       // The run response carries the list, not each workflow's history.
       loadAutomationRuns({ force: true });
-      showToast(`“${automation.name}” finished${payload.isDemo ? ' in demo mode' : ''}.`);
+      const steps = payload.steps || [];
+      const exported = (payload.files || [])[0];
+      showToast(exported
+        ? `“${automation.name}” finished · ${exported.name} saved to this project's files.`
+        : `“${automation.name}” ran ${steps.length} step${steps.length === 1 ? '' : 's'}${payload.isDemo ? ' in demo mode' : ''}.`);
+      // A chain with no generator step has no text to show; the toast and the
+      // run log are the result.
+      if (!payload.output) return;
       const view = openGenerationModal({ prompt: '', mode: 'Writing', model: payload.generation?.model || 'Auto select' });
-      view.text = payload.output || '';
+      view.text = payload.output;
       if (view.stream) { view.stream.classList.remove('is-streaming', 'is-empty'); view.stream.textContent = view.text; }
       finishOutput(view, { generation: payload.generation, failed: false });
       if (view.status) view.status.textContent = `Automation output · ${automation.name}`;
@@ -2049,6 +2184,28 @@
         break;
       }
       case 'new-automation': openNewAutomationModal(); break;
+      case 'add-step': {
+        syncStepDraft();
+        const next = stepCatalog().find((entry) => entry.available !== false && !state.stepDraft.some((step) => step.action === entry.id)) || stepCatalog().find((entry) => entry.available !== false);
+        if (!state.stepDraft.length) state.stepDraft = [{ action: 'generate', options: {} }];
+        else if (state.stepDraft.length >= 5) { showToast('A workflow can run at most five steps.', 'error'); break; }
+        else state.stepDraft = [...state.stepDraft, { action: next?.id || 'export', options: {} }];
+        rerenderStepDraft();
+        break;
+      }
+      case 'remove-step': {
+        syncStepDraft();
+        state.stepDraft = state.stepDraft.filter((_, index) => index !== Number(button.dataset.index));
+        if (!state.stepDraft.length) state.stepDraft = [{ action: 'generate', options: {} }];
+        rerenderStepDraft();
+        break;
+      }
+      case 'toggle-run': {
+        const runId = button.dataset.id;
+        state.openRuns = { ...state.openRuns, [runId]: !state.openRuns[runId] };
+        renderPage();
+        break;
+      }
       case 'toggle-automation': toggleAutomation(id); break;
       case 'run-automation': if (blockedWrite()) break; runAutomation(id); break;
       case 'automation-templates': showToast('Templates are on the roadmap; create a workflow by hand for now.'); break;
@@ -2203,6 +2360,13 @@
   // both would upload the same file twice.
   document.addEventListener('change', (event) => {
     if (event.target.matches?.('[data-schedule-kind]')) syncScheduleFields(event.target.closest('form') || document);
+    if (event.target.matches?.('[data-step-kind]')) {
+      // Read what is there first, so switching a row's kind keeps its siblings.
+      syncStepDraft();
+      const index = Number(event.target.dataset.stepKind);
+      if (state.stepDraft[index]) state.stepDraft[index].options = {};
+      rerenderStepDraft();
+    }
     if (event.target.matches?.('[data-action="change-role"]')) {
       changeMemberRole(event.target.dataset.id, event.target.value);
       return;
@@ -2323,12 +2487,14 @@
       event.preventDefault();
       const data = new FormData(event.target);
       const schedule = scheduleFromForm(data);
+      const steps = syncStepDraft();
       api.request('/api/automations', {
         method: 'POST',
         body: {
           name: String(data.get('name') || '').trim(),
           description: String(data.get('description') || '').trim(),
-          action: String(data.get('action') || 'Curate & summarize'),
+          timeZone: String(data.get('timeZone') || '').trim(),
+          steps,
           schedule,
         },
       }).then((payload) => {
@@ -2374,7 +2540,8 @@
         name: String(data.get('name') || '').trim(),
         description: String(data.get('description') || '').trim() || 'A new workflow for the little things that add up.',
         trigger: String(data.get('trigger') || 'On demand'),
-        action: String(data.get('action') || 'Curate & summarize'),
+        action: syncStepDraft()[0]?.action || 'generate',
+        steps: syncStepDraft(),
         lastRun: 'Not run yet',
         enabled: true,
         tone: 'purple',

@@ -35,6 +35,7 @@ stranger to sign up claims the seeded workspace.
 | Reference files | ✅ Upload images and documents; images go to the model as vision input |
 | Generated assets | ✅ Stored as files and served by URL, not inlined in rows |
 | File storage | ✅ Local disk by default; switch to any S3-compatible bucket (AWS, R2, MinIO, B2) with one env var |
+| Automations | ✅ Chains of up to five steps — generate, export (Markdown or zip), tidy, webhook — each run logged step by step |
 | Accounts | ✅ Sign-up / sign-in with scrypt-hashed passwords and hashed session cookies |
 | Teams & roles | ✅ Owner / admin / editor / viewer per workspace, enforced on every route |
 | Workspaces | ✅ Per-user workspaces, switching, renaming, transfer, delete; complete data isolation |
@@ -46,7 +47,7 @@ stranger to sign up claims the seeded workspace.
 ```bash
 npm start              # production-ish: plain node, quiet experimental warnings
 npm run dev            # same, with --watch for auto restart on file changes
-npm test               # 188-check end-to-end self test (uses a temporary database)
+npm test               # 237-check end-to-end self test (uses a temporary database)
 ```
 
 Then open <http://localhost:4173>. The server binds `0.0.0.0` so it also works from a container or
@@ -126,16 +127,16 @@ A schedule is data, not prose, so the server can tell when something is due:
 { type: 'manual' }
 ```
 
-Wall-clock times are interpreted in the workspace timezone (Settings → Preferences), because "every
-Monday at 9" means 9am for the person who wrote it. One scheduler timer in the server finds due
-workflows, **moves each one's next run forward before executing it**, then runs it through the same
-executor the Run-now button uses — so manual, scheduled, and event runs all produce identical rows
-in `automation_runs`.
+Wall-clock times are interpreted in the automation's own time zone if it has one, and in the
+workspace time zone otherwise (Settings → Preferences), because "every Monday at 9" means 9am for
+the person who wrote it. One scheduler timer in the server finds due workflows, **moves each one's
+next run forward before executing it**, then runs it through the same executor the Run-now button
+uses — so manual, scheduled, and event runs all produce identical rows in `automation_runs`.
 
 Two policies are deliberate: a server that was offline for a week runs a due workflow **once**
 rather than catching up on 168 missed windows, and a failed run **backs off** instead of retrying
-in a tight loop. Every run is recorded with its source (`manual`, `scheduled`, `event`), its status,
-and the generation it produced.
+in a tight loop. Every run is recorded with its source (`manual`, `scheduled`, `event`) and a row
+per step — see [Automations are chains of steps](#automations-are-chains-of-steps).
 
 ## Accounts, workspaces, and roles
 
@@ -180,6 +181,53 @@ on this machine by default, or any S3-compatible bucket. A generation can refere
 
 Generated images are stored as files too, so project rows stay small and browsers can cache and
 download assets like any other URL: `GET /api/files/:id`.
+
+## Automations are chains of steps
+
+A workflow is a list of steps that run in order. Four kinds:
+
+| Step | What it does |
+| --- | --- |
+| **Generate** | Runs a model and keeps the output on the project |
+| **Export** | Writes the project out as a Markdown brief, or a zip with its generations and reference files |
+| **Tidy** | Archives the projects that finished long enough ago to be history |
+| **Webhook** | POSTs a JSON run summary to a host you allow-list |
+
+```bash
+curl -s -b cookies.txt -X POST localhost:4173/api/automations \
+  -H 'content-type: application/json' -d '{
+    "name": "Friday handoff",
+    "schedule": { "type": "daily", "time": "16:00", "daysOfWeek": [5] },
+    "timeZone": "Asia/Kolkata",
+    "steps": [
+      { "action": "generate" },
+      { "action": "export", "options": { "format": "zip" } },
+      { "action": "webhook", "options": { "url": "https://hooks.example.com/studio" } }
+    ]
+  }'
+```
+
+Three things worth knowing:
+
+- **A failure stops the chain and says where.** The remaining steps are recorded as skipped, and the
+  run log keeps a row per step — what it did, how long it took, and how many attempts it needed. The
+  point of a run log is answering "did the 3am workflow work?" without opening a terminal.
+- **Transient failures retry, rejections do not.** A rate limit, a 5xx, or a dropped connection is
+  retried twice with exponential backoff; a 4xx is never posted twice. A step's `retries` and
+  `backoffMs` options override the defaults.
+- **Webhooks are off until you allow a host**, because a step that posts to a URL is a request from
+  your server to whatever that URL names:
+
+  ```bash
+  AI_STUDIO_WEBHOOK_ALLOW=hooks.slack.com,discord.com
+  ```
+
+  An exact entry may point anywhere, including `127.0.0.1` for a local collector. A wildcard like
+  `*.example.com` is refused if it resolves to a private address, and the step is not offered in the
+  UI at all when the list is empty. See [docs/API.md](docs/API.md#webhooks) for the payload.
+
+Schedules use the automation's own time zone (`timeZone`) before the workspace default, so a Monday
+9am digest means 9am where the studio is — not where the server happens to run.
 
 ## Object storage
 
@@ -237,6 +285,10 @@ server/
   schedule.js       schedule data model, timezone math, next-occurrence engine
   scheduler.js      the tick loop: claim, run, reschedule, back off
   automations.js    one executor shared by manual, scheduled, and event runs
+  automations.js    the step engine: chains, retries, run ledger
+  exports.js        project → Markdown brief / zip archive
+  zip.js            a zip writer (STORE + CRC-32), no dependency
+  webhook.js        outbound webhooks behind an allow list
   files.js          multipart parsing, file metadata, attachment preparation
   storage/
     index.js        driver selection: local, s3, and reads across both
@@ -254,9 +306,9 @@ data/               SQLite database + uploaded/generated files (git-ignored)
 ## Tests
 
 ```bash
-npm test                           # 188 API, auth, tenancy, storage, and migration checks
+npm test                           # 237 API, auth, tenancy, storage, automation, and migration checks
 npm i --no-save jsdom              # test-only, never a runtime dependency
-npm run test:frontend              # 126 UI checks (starts its own server)
+npm run test:frontend              # 138 UI checks (starts its own server)
 npm run storage:check              # is the configured bucket actually reachable?
 ```
 
@@ -279,6 +331,12 @@ rows, output counts, credits, and usage aggregates they produce. It covers:
   presigned redirects, mixed local+S3 reads after a driver switch, and workspace deletion purging
   the bucket are all exercised there — as is a reject-wrong-secret case, so the test fails if the
   client ever signs something the bucket would refuse;
+- **automation steps**: a local HTTP receiver stands in for a webhook target. A three-step chain
+  runs end to end; the zip export is read back through its own central directory with every checksum
+  recomputed; a flaky receiver proves the retry really calls twice and a rejection really calls once;
+  and the webhook guard is tested with DNS stubbed, so metadata addresses, wildcards resolving to
+  private space, off-list hosts, and `file://` are all refused in the suite rather than in
+  production;
 - **the upgrade path**: a database built with the previous version's schema (kept in
   `server/fixtures/legacy-db.sql`) boots, migrates, and keeps its projects, generations, settings,
   and activity.
@@ -321,17 +379,22 @@ promotes, removes, and verifies them — failing if anything logs an error or th
   grants are the next step if teams need them.
 - **The first sign-up wins.** Until an owner exists, the demo workspace is claimable by anyone who
   reaches the server. Create the owner account before exposing a fresh instance.
-- **Workspace chores still need you.** Automations that generate (digests, handoffs, briefs) run
-  end to end; steps that are not a generation (tidying projects, sending email) record themselves
-  as `skipped` rather than pretending they happened.
+- **Steps are a fixed set of four, and there is no branching.** A chain runs top to bottom and stops
+  at the first failure; there are no conditions, parallel steps, or loops. Five steps is the ceiling.
+- **Zip exports are uncompressed.** `server/zip.js` stores entries rather than deflating them, which
+  keeps the writer small; an export is bigger than it needs to be and caps out at 25 MB.
+- **Webhooks are one-shot POSTs.** No delivery queue, no automatic retry after the run ends, no
+  signing header, and no way to receive anything back beyond the status code the run log records.
+  A webhook that fails after the retries is a failed run — press Run again.
 
 ## Roadmap
 
-1. ~~**Object storage**~~ — shipped in this phase: a storage driver layer with a local and an
-   S3-compatible driver, per-row driver memory, and a bucket probe.
-2. ~~**Accounts and teams**~~ — shipped earlier: users, workspaces, memberships, invites, roles.
-3. **Billing** — real plan management instead of the estimated credits ledger.
-4. **Canvas** — a real node/graph editor instead of the current concept page.
-5. **Non-generation automation steps** — project tidying, exports, and outbound notifications.
+1. ~~**Object storage**~~ — shipped: a storage driver layer with a local and an S3-compatible driver,
+   per-row driver memory, and a bucket probe.
+2. ~~**Accounts and teams**~~ — shipped: users, workspaces, memberships, invites, roles.
+3. ~~**Automations that do more**~~ — shipped: step chains, exports, tidying, webhooks with retries,
+   and a per-step run log.
+4. **Billing** — real plan management instead of the estimated credits ledger.
+5. **Canvas** — a real node/graph editor instead of the current concept page.
 6. **Account depth** — email verification, password reset, per-project sharing, and a shared session
    store so more than one server process can serve the same workspace.
